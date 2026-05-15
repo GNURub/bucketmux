@@ -1,5 +1,7 @@
 # BucketMux
 
+![BucketMux architecture diagram](./image.png)
+
 **BucketMux** is a self-hosted, S3-compatible storage gateway that lets you route objects across multiple storage providers from one API.
 
 It is designed for small teams, side projects, prototypes and cost-conscious deployments that want to combine free-tier or low-cost storage accounts without exposing that complexity to the client application.
