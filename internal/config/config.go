@@ -11,19 +11,21 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig     `yaml:"server"`
-	Store     StoreConfig      `yaml:"store"`
-	S3        S3Config         `yaml:"s3"`
-	Admin     AdminConfig      `yaml:"admin"`
-	Providers []ProviderConfig `yaml:"providers"`
-	Buckets   []BucketConfig   `yaml:"buckets"`
+	Server       ServerConfig       `yaml:"server"`
+	Store        StoreConfig        `yaml:"store"`
+	Coordination CoordinationConfig `yaml:"coordination"`
+	S3           S3Config           `yaml:"s3"`
+	Admin        AdminConfig        `yaml:"admin"`
+	Providers    []ProviderConfig   `yaml:"providers"`
+	Buckets      []BucketConfig     `yaml:"buckets"`
 }
 
 type ServerConfig struct {
-	Addr      string `yaml:"addr"`
-	DataDir   string `yaml:"data_dir"`
-	DBPath    string `yaml:"db_path"`
-	MasterKey string `yaml:"master_key"`
+	Addr          string `yaml:"addr"`
+	DataDir       string `yaml:"data_dir"`
+	DBPath        string `yaml:"db_path"`
+	MasterKey     string `yaml:"master_key"`
+	PublicBaseURL string `yaml:"public_base_url"`
 }
 
 type StoreConfig struct {
@@ -40,6 +42,19 @@ type PostgresStoreConfig struct {
 	DSN          string `yaml:"dsn"`
 	MaxOpenConns int    `yaml:"max_open_conns"`
 	MaxIdleConns int    `yaml:"max_idle_conns"`
+}
+
+type CoordinationConfig struct {
+	Kind  string      `yaml:"kind"`
+	Redis RedisConfig `yaml:"redis"`
+}
+
+type RedisConfig struct {
+	Addr            string `yaml:"addr"`
+	Password        string `yaml:"password"`
+	DB              int    `yaml:"db"`
+	KeyPrefix       string `yaml:"key_prefix"`
+	LeaseTTLSeconds int    `yaml:"lease_ttl_seconds"`
 }
 
 type S3Config struct {
@@ -94,11 +109,12 @@ func Load(path string) (Config, error) {
 
 func Default() Config {
 	return Config{
-		Server:  ServerConfig{Addr: ":8080", DataDir: "/data", DBPath: "/data/switcher.db"},
-		Store:   StoreConfig{Kind: "sqlite", SQLite: SQLiteStoreConfig{Path: "/data/switcher.db"}, Postgres: PostgresStoreConfig{MaxOpenConns: 25, MaxIdleConns: 10}},
-		S3:      S3Config{Region: "auto"},
-		Admin:   AdminConfig{Enabled: false, Username: "admin"},
-		Buckets: []BucketConfig{{Name: "images"}},
+		Server:       ServerConfig{Addr: ":8080", DataDir: "/data", DBPath: "/data/switcher.db"},
+		Store:        StoreConfig{Kind: "sqlite", SQLite: SQLiteStoreConfig{Path: "/data/switcher.db"}, Postgres: PostgresStoreConfig{MaxOpenConns: 25, MaxIdleConns: 10}},
+		Coordination: CoordinationConfig{Kind: "database", Redis: RedisConfig{Addr: "127.0.0.1:6379", KeyPrefix: "bucketmux", LeaseTTLSeconds: 5}},
+		S3:           S3Config{Region: "auto"},
+		Admin:        AdminConfig{Enabled: false, Username: "admin"},
+		Buckets:      []BucketConfig{{Name: "images"}},
 	}
 }
 
@@ -125,6 +141,15 @@ func (c Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unknown store.kind %q", c.Store.Kind)
+	}
+	switch c.Coordination.Kind {
+	case "", "database":
+	case "redis":
+		if strings.TrimSpace(c.Coordination.Redis.Addr) == "" {
+			return errors.New("coordination.redis.addr is required when coordination.kind=redis")
+		}
+	default:
+		return fmt.Errorf("unknown coordination.kind %q", c.Coordination.Kind)
 	}
 	if c.Server.MasterKey == "" {
 		return errors.New("server.master_key or MASTER_KEY is required")
@@ -160,6 +185,19 @@ func (c *Config) Normalize() {
 	if c.Server.DBPath == "" {
 		c.Server.DBPath = c.Store.SQLite.Path
 	}
+	c.Coordination.Kind = strings.TrimSpace(c.Coordination.Kind)
+	if c.Coordination.Kind == "" {
+		c.Coordination.Kind = "database"
+	}
+	if c.Coordination.Redis.Addr == "" {
+		c.Coordination.Redis.Addr = "127.0.0.1:6379"
+	}
+	if c.Coordination.Redis.KeyPrefix == "" {
+		c.Coordination.Redis.KeyPrefix = "bucketmux"
+	}
+	if c.Coordination.Redis.LeaseTTLSeconds == 0 {
+		c.Coordination.Redis.LeaseTTLSeconds = 5
+	}
 }
 
 func applyEnv(c *Config) {
@@ -170,11 +208,18 @@ func applyEnv(c *Config) {
 		c.Store.SQLite.Path = value
 	}
 	setString(&c.Server.MasterKey, "MASTER_KEY")
+	setString(&c.Server.PublicBaseURL, "PUBLIC_BASE_URL")
 	setString(&c.Store.Kind, "STORE_KIND")
 	setString(&c.Store.SQLite.Path, "SQLITE_PATH")
 	setString(&c.Store.Postgres.DSN, "POSTGRES_DSN")
 	setInt(&c.Store.Postgres.MaxOpenConns, "POSTGRES_MAX_OPEN_CONNS")
 	setInt(&c.Store.Postgres.MaxIdleConns, "POSTGRES_MAX_IDLE_CONNS")
+	setString(&c.Coordination.Kind, "COORDINATION_KIND")
+	setString(&c.Coordination.Redis.Addr, "REDIS_ADDR")
+	setString(&c.Coordination.Redis.Password, "REDIS_PASSWORD")
+	setInt(&c.Coordination.Redis.DB, "REDIS_DB")
+	setString(&c.Coordination.Redis.KeyPrefix, "REDIS_KEY_PREFIX")
+	setInt(&c.Coordination.Redis.LeaseTTLSeconds, "REDIS_LEASE_TTL_SECONDS")
 	setString(&c.S3.AccessKey, "S3_ACCESS_KEY")
 	setString(&c.S3.SecretKey, "S3_SECRET_KEY")
 	setString(&c.S3.Region, "S3_REGION")

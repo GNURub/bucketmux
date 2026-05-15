@@ -33,7 +33,7 @@ func TestAdminIndexShowsProviderForm(t *testing.T) {
 		t.Fatalf("status = %d body=%s", res.Code, res.Body.String())
 	}
 	body := res.Body.String()
-	for _, want := range []string{"Action center", `data-open-dialog="provider-dialog"`, `<dialog id="provider-dialog"`, `<dialog id="bucket-dialog"`, `<dialog id="upload-dialog"`, `<dialog id="hook-dialog"`, `<dialog id="migration-dialog"`, `<dialog id="delete-object-dialog"`, "Eliminar permanentemente", "Migrar permanentemente", "Object browser", "Migration jobs", `id="object-browser-bucket"`, `id="migration-form"`, `id="migration-job-rows"`, `data-browse-objects`, "scrollIntoView", "/admin/api/objects/presign", "/admin/api/migrations", "Add / update provider", `name="secret_key"`, `value="s3-compatible"`, `settings_path`, `id="admin-upload-form"`, `name="replication_provider_ids"`, "Provider health", "Add / update HTTP hook", "Hook delivery history", "Secret headers"} {
+	for _, want := range []string{"Action center", `data-open-dialog="provider-dialog"`, `<dialog id="provider-dialog"`, `<dialog id="bucket-dialog"`, `<dialog id="upload-dialog"`, `<dialog id="hook-dialog"`, `<dialog id="migration-dialog"`, `<dialog id="delete-object-dialog"`, "Eliminar permanentemente", "Migrar permanentemente", "Object browser", "Migration jobs", "Audit log", `id="object-browser-bucket"`, `id="migration-form"`, `id="migration-job-rows"`, `data-browse-objects`, "scrollIntoView", "/admin/api/objects/presign", "/admin/api/migrations", "Add / update provider", `name="secret_key"`, `value="s3-compatible"`, `settings_path`, `settings_cost_per_gb_month`, `settings_max_object_size_bytes`, `id="admin-upload-form"`, `name="replication_provider_ids"`, "Provider health", "Add / update HTTP hook", "Hook delivery history", "Secret headers"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("admin body missing %q", want)
 		}
@@ -295,6 +295,39 @@ func TestAdminBrowseObjectsAndGeneratePublicURL(t *testing.T) {
 	}
 }
 
+func TestAdminPresignUsesConfiguredPublicBaseURL(t *testing.T) {
+	handler, cleanup := newTestAdminHandlerWithProvider(t)
+	defer cleanup()
+	handler.svc.Config.Server.PublicBaseURL = "https://cdn.example.test/bucketmux"
+
+	_, err := handler.svc.PutObject(context.Background(), domain.PutObjectInput{
+		Bucket:      "images",
+		Key:         "folder/cat.txt",
+		Size:        int64(len("cat")),
+		ContentType: "text/plain",
+	}, strings.NewReader("cat"))
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+
+	path := "/admin/api/objects/presign?bucket=images&key=" + url.QueryEscape("folder/cat.txt") + "&expires=600"
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("presign status = %d body=%s", res.Code, res.Body.String())
+	}
+	var presigned objectPresignResponse
+	if err := json.NewDecoder(res.Body).Decode(&presigned); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if !strings.HasPrefix(presigned.URL, "https://cdn.example.test/bucketmux/images/folder/cat.txt?") {
+		t.Fatalf("presigned URL = %s", presigned.URL)
+	}
+}
+
 func TestAdminDeleteObjectRequiresExactConfirmation(t *testing.T) {
 	handler, cleanup := newTestAdminHandlerWithProvider(t)
 	defer cleanup()
@@ -336,6 +369,13 @@ func TestAdminDeleteObjectRequiresExactConfirmation(t *testing.T) {
 	}
 	if _, err := handler.svc.Store.GetObject(context.Background(), "images", "delete/me.txt"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("GetObject() error = %v, want ErrNotFound", err)
+	}
+	events, err := handler.svc.Store.ListAuditEvents(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v", err)
+	}
+	if len(events) != 1 || events[0].Action != domain.AuditActionObjectDeleted || events[0].Bucket != "images" || events[0].Key != "delete/me.txt" {
+		t.Fatalf("audit events = %+v", events)
 	}
 }
 

@@ -96,6 +96,8 @@ The optional embedded admin can be disabled completely. When enabled, it provide
 - safe object deletion requiring the exact confirmation phrase `Eliminar permanentemente`
 - provider health checks
 - usage by provider and bucket
+- migration jobs by bucket/prefix with progress history
+- audit log for destructive admin operations
 - HTTP hooks/webhooks
 - secret webhook headers
 - delivery history and retry visibility
@@ -294,6 +296,9 @@ providers:
     enabled: true
     settings:
       path: "/data/local-provider"
+      cost_per_gb_month: "0"
+      max_object_size_bytes: "0"
+      min_free_bytes: "0"
 ```
 
 ### Environment overrides
@@ -305,6 +310,7 @@ Common environment variables:
 | `CONFIG_PATH` | Path to YAML config. |
 | `ADDR` | HTTP listen address. |
 | `DATA_DIR` | Runtime data directory. |
+| `PUBLIC_BASE_URL` | External base URL used when the admin generates public presigned links behind a reverse proxy. |
 | `MASTER_KEY` | Secret used to encrypt stored provider credentials. |
 | `S3_ACCESS_KEY` | Gateway access key. |
 | `S3_SECRET_KEY` | Gateway secret key. |
@@ -317,6 +323,12 @@ Common environment variables:
 | `POSTGRES_DSN` | Postgres connection string. |
 | `POSTGRES_MAX_OPEN_CONNS` | Max open Postgres connections. |
 | `POSTGRES_MAX_IDLE_CONNS` | Max idle Postgres connections. |
+| `COORDINATION_KIND` | `database` or `redis`. Defaults to database-backed job claims. |
+| `REDIS_ADDR` | Redis address for optional distributed worker leases. |
+| `REDIS_PASSWORD` | Redis password. |
+| `REDIS_DB` | Redis database number. |
+| `REDIS_KEY_PREFIX` | Prefix for Redis worker lease keys. |
+| `REDIS_LEASE_TTL_SECONDS` | Lease TTL for Redis worker coordination. |
 
 ---
 
@@ -343,6 +355,16 @@ Local objects are stored under:
 ```
 
 Object keys are validated to reject path traversal such as `../secret`.
+
+### Provider routing policies
+
+Provider `settings` can define optional routing policies:
+
+| Setting | Effect |
+| --- | --- |
+| `cost_per_gb_month` | Lower cost wins when provider priority is tied. |
+| `max_object_size_bytes` | Skip the provider for larger objects. |
+| `min_free_bytes` | Keep this amount of capacity free after routing an upload. |
 
 ### Cloudflare R2 / AWS S3 / MinIO / SeaweedFS
 
@@ -538,7 +560,32 @@ buckets:
       - "minio-backup"
 ```
 
-When an object is uploaded, BucketMux writes the primary object according to placement rules and then replicates to the selected providers. The object index tracks replica status.
+When an object is uploaded, BucketMux writes the primary object according to placement rules and enqueues replica jobs for the selected providers. Background workers claim pending replicas, copy the object to the target providers and update replica status in the object index.
+
+This keeps uploads fast and makes replication safe for multi-instance deployments.
+
+---
+
+## Coordination and metrics
+
+Background work uses database-backed job claims by default. For high-load multi-instance deployments, enable Redis leases around worker polling:
+
+```yaml
+coordination:
+  kind: "redis"
+  redis:
+    addr: "redis:6379"
+    key_prefix: "bucketmux"
+    lease_ttl_seconds: 5
+```
+
+Prometheus-compatible metrics are exposed at:
+
+```text
+GET /metrics
+```
+
+The endpoint includes provider usage, capacity, bucket/provider usage, migration job counts and hook delivery counts.
 
 ---
 
@@ -564,6 +611,8 @@ Useful endpoints:
 | `GET /admin/api/hooks` | List hooks. |
 | `POST /admin/api/hooks` | Create or update hook. |
 | `GET /admin/api/hook-deliveries` | Hook delivery history. |
+| `GET /admin/api/migrations` | List migration jobs. |
+| `POST /admin/api/migrations` | Create a copy/move migration job for a bucket/prefix. |
 | `GET /admin/api/objects` | Browse indexed objects. |
 | `GET /admin/api/objects/presign` | Generate public presigned GET URL. |
 | `DELETE /admin/api/objects` | Delete object after confirmation phrase. |
@@ -728,18 +777,6 @@ Not currently implemented:
 - object versioning,
 - S3 event notifications API,
 - all AWS-specific error edge cases.
-
----
-
-## Roadmap ideas
-
-- Background replication queue.
-- Redis-backed coordination for high-load multi-instance deployments.
-- Explicit public base URL config for complex reverse proxy setups.
-- More S3 compatibility tests across SDKs.
-- Admin audit log for destructive operations.
-- Prometheus metrics.
-- Provider cost/quota policies.
 
 ---
 

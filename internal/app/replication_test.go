@@ -47,21 +47,42 @@ func TestPutObjectReplicatesToSelectedBucketProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewService() error = %v", err)
 	}
+	if svc.cancelWorkers != nil {
+		svc.cancelWorkers()
+		svc.workerWG.Wait()
+	}
 	defer svc.Close()
 
 	obj, err := svc.PutObject(context.Background(), domain.PutObjectInput{Bucket: "images", Key: "photos/demo.txt", Size: int64(len("replicated")), ContentType: "text/plain"}, strings.NewReader("replicated"))
 	if err != nil {
 		t.Fatalf("PutObject() error = %v", err)
 	}
-	if obj.ProviderAccountID != "local-primary" || obj.ReplicaStatus != "completed" {
+	if obj.ProviderAccountID != "local-primary" || obj.ReplicaStatus != "pending" {
 		t.Fatalf("object = %+v", obj)
 	}
 	replicas, err := svc.Store.ListObjectReplicas(context.Background(), "images", "photos/demo.txt")
 	if err != nil {
 		t.Fatalf("ListObjectReplicas() error = %v", err)
 	}
-	if len(replicas) != 1 || replicas[0].ProviderAccountID != "local-replica" || replicas[0].Status != "succeeded" {
+	if len(replicas) != 1 || replicas[0].ProviderAccountID != "local-replica" || replicas[0].Status != "pending" {
 		t.Fatalf("replicas = %+v", replicas)
+	}
+	if err := svc.RunObjectReplication(context.Background(), "images", "photos/demo.txt", "local-replica"); err != nil {
+		t.Fatalf("RunObjectReplication() error = %v", err)
+	}
+	obj, err = svc.Store.GetObject(context.Background(), "images", "photos/demo.txt")
+	if err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	}
+	if obj.ReplicaStatus != "completed" {
+		t.Fatalf("replica status = %s, want completed", obj.ReplicaStatus)
+	}
+	replicas, err = svc.Store.ListObjectReplicas(context.Background(), "images", "photos/demo.txt")
+	if err != nil {
+		t.Fatalf("ListObjectReplicas(after run) error = %v", err)
+	}
+	if len(replicas) != 1 || replicas[0].ProviderAccountID != "local-replica" || replicas[0].Status != "succeeded" {
+		t.Fatalf("replicas after run = %+v", replicas)
 	}
 	data, err := os.ReadFile(filepath.Join(dataDir, "replica", "images", "photos", "demo.txt"))
 	if err != nil {

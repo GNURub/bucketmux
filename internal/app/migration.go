@@ -75,10 +75,15 @@ func (s *Service) StartMigrationWorker(ctx context.Context) {
 			return
 		default:
 		}
-		job, ok, err := s.Store.ClaimNextMigrationJob(ctx)
-		if err == nil && ok {
-			_ = s.RunMigrationJob(ctx, job.ID)
-			continue
+		lease, leased := s.tryWorkerLease(ctx, "migration")
+		if leased {
+			job, ok, err := s.Store.ClaimNextMigrationJob(ctx)
+			if err == nil && ok {
+				_ = s.RunMigrationJob(ctx, job.ID)
+				_ = lease.Release(ctx)
+				continue
+			}
+			_ = lease.Release(ctx)
 		}
 		select {
 		case <-ctx.Done():

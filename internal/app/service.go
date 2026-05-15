@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gnurub/bucketmux/internal/config"
+	"github.com/gnurub/bucketmux/internal/coordination"
 	secretcrypto "github.com/gnurub/bucketmux/internal/crypto"
 	"github.com/gnurub/bucketmux/internal/domain"
 	"github.com/gnurub/bucketmux/internal/provider"
@@ -27,6 +28,8 @@ type Service struct {
 	Router    *placement.PlacementRouter
 	Config    config.Config
 
+	Coordinator    coordination.Coordinator
+	WorkerLeaseTTL time.Duration
 	HookHTTPClient *http.Client
 	HookRetryDelay func(attempts int) time.Duration
 	cancelWorkers  context.CancelFunc
@@ -48,6 +51,15 @@ func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 		return nil, err
 	}
 	workerCtx, cancelWorkers := context.WithCancel(ctx)
+	coordinator := coordination.Coordinator(coordination.NoopCoordinator{})
+	if cfg.Coordination.Kind == "redis" {
+		coordinator = coordination.NewRedis(coordination.RedisConfig{
+			Addr:      cfg.Coordination.Redis.Addr,
+			Password:  cfg.Coordination.Redis.Password,
+			DB:        cfg.Coordination.Redis.DB,
+			KeyPrefix: cfg.Coordination.Redis.KeyPrefix,
+		})
+	}
 	svc := &Service{
 		Store:   db,
 		Secrets: secrets,
@@ -60,6 +72,8 @@ func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 		Router: placement.NewPlacementRouter(db),
 		Config: cfg,
 
+		Coordinator:    coordinator,
+		WorkerLeaseTTL: time.Duration(cfg.Coordination.Redis.LeaseTTLSeconds) * time.Second,
 		HookHTTPClient: &http.Client{Timeout: defaultHookTimeout},
 		cancelWorkers:  cancelWorkers,
 	}
@@ -76,6 +90,11 @@ func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 	go func() {
 		defer svc.workerWG.Done()
 		svc.StartMigrationWorker(workerCtx)
+	}()
+	svc.workerWG.Add(1)
+	go func() {
+		defer svc.workerWG.Done()
+		svc.StartReplicationWorker(workerCtx)
 	}()
 	return svc, nil
 }
@@ -179,12 +198,26 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 	}
 	_ = s.Store.AddProviderUsage(ctx, primary.ID, stored.Size)
 	if len(targets) > 0 {
-		replicaStatus = s.replicateObject(ctx, input, obj, targets)
-		obj.ReplicaStatus = replicaStatus
-		_ = s.Store.PutObject(ctx, obj)
+		_ = s.enqueueObjectReplicas(ctx, obj, targets)
 	}
 	s.dispatchObjectHook(ctx, domain.HookEventObjectCreated, obj)
 	return obj, nil
+}
+
+func (s *Service) tryWorkerLease(ctx context.Context, name string) (coordination.Lease, bool) {
+	if s.Coordinator == nil {
+		lease, ok, _ := coordination.NoopCoordinator{}.TryAcquire(ctx, name, s.WorkerLeaseTTL)
+		return lease, ok
+	}
+	ttl := s.WorkerLeaseTTL
+	if ttl <= 0 {
+		ttl = 5 * time.Second
+	}
+	lease, ok, err := s.Coordinator.TryAcquire(ctx, name, ttl)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return lease, true
 }
 
 func (s *Service) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, domain.ObjectRecord, error) {

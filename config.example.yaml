@@ -3,6 +3,9 @@ server:
   data_dir: "/data"
   # Deprecated but still supported for SQLite. Prefer store.sqlite.path.
   db_path: "/data/switcher.db"
+  # Optional. Use when BucketMux runs behind a reverse proxy/path and admin-generated
+  # presigned public URLs must point to the external origin.
+  public_base_url: "https://files.example.com"
   # Prefer MASTER_KEY env var in production.
   master_key: "change-me-use-a-long-random-secret"
 
@@ -14,6 +17,17 @@ store:
     dsn: "postgres://bucketmux:bucketmux@postgres:5432/bucketmux?sslmode=disable"
     max_open_conns: 25
     max_idle_conns: 10
+
+coordination:
+  # database works for single and multi-instance deployments through DB job claims.
+  # redis adds a short distributed lease around background workers.
+  kind: "database" # database | redis
+  redis:
+    addr: "redis:6379"
+    password: ""
+    db: 0
+    key_prefix: "bucketmux"
+    lease_ttl_seconds: 5
 
 s3:
   access_key: "local-access-key"
@@ -44,6 +58,13 @@ providers:
     settings:
       # Absolute paths are used as-is. Relative paths are resolved under server.data_dir.
       path: "/data/local-provider"
+      # Optional routing policies:
+      # lower cost wins when provider priority is tied.
+      cost_per_gb_month: "0"
+      # skip this provider for larger objects.
+      max_object_size_bytes: "0"
+      # keep free space reserved after each routed upload.
+      min_free_bytes: "0"
 
   # Cloudflare R2 / Backblaze B2 / MinIO / GCS XML API style provider.
   # - id: "r2-main"

@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS object_replicas (
   PRIMARY KEY (bucket, key, provider_account_id)
 );
 CREATE INDEX IF NOT EXISTS idx_object_replicas_bucket_key ON object_replicas(bucket, key);
+CREATE INDEX IF NOT EXISTS idx_object_replicas_status ON object_replicas(status, updated_at);
 CREATE TABLE IF NOT EXISTS multipart_uploads (
   upload_id TEXT PRIMARY KEY,
   bucket TEXT NOT NULL,
@@ -254,6 +255,18 @@ CREATE TABLE IF NOT EXISTS migration_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_migration_jobs_recent ON migration_jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_migration_jobs_status ON migration_jobs(status, created_at);
+CREATE TABLE IF NOT EXISTS audit_events (
+  id TEXT PRIMARY KEY,
+  actor TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  bucket TEXT NOT NULL DEFAULT '',
+  key TEXT NOT NULL DEFAULT '',
+  target_id TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_recent ON audit_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action, created_at DESC);
 `
 	_, err := s.exec(ctx, schema)
 	if err != nil {
@@ -652,6 +665,45 @@ func (s *Store) ListObjectReplicas(ctx context.Context, bucket, key string) ([]d
 	return out, rows.Err()
 }
 
+func (s *Store) ClaimNextObjectReplica(ctx context.Context) (domain.ObjectReplica, bool, error) {
+	rows, err := s.query(ctx, `SELECT bucket, key, provider_account_id FROM object_replicas WHERE status = ? ORDER BY updated_at ASC LIMIT 5`, "pending")
+	if err != nil {
+		return domain.ObjectReplica{}, false, err
+	}
+	defer rows.Close()
+	var candidates []domain.ObjectReplica
+	for rows.Next() {
+		var replica domain.ObjectReplica
+		if err := rows.Scan(&replica.Bucket, &replica.Key, &replica.ProviderAccountID); err != nil {
+			return domain.ObjectReplica{}, false, err
+		}
+		candidates = append(candidates, replica)
+	}
+	if err := rows.Err(); err != nil {
+		return domain.ObjectReplica{}, false, err
+	}
+	for _, candidate := range candidates {
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		res, err := s.exec(ctx, `UPDATE object_replicas SET status = ?, error = '', updated_at = ? WHERE bucket = ? AND key = ? AND provider_account_id = ? AND status = ?`, "running", now, candidate.Bucket, candidate.Key, candidate.ProviderAccountID, "pending")
+		if err != nil {
+			return domain.ObjectReplica{}, false, err
+		}
+		changed, _ := res.RowsAffected()
+		if changed == 1 {
+			replicas, err := s.ListObjectReplicas(ctx, candidate.Bucket, candidate.Key)
+			if err != nil {
+				return domain.ObjectReplica{}, false, err
+			}
+			for _, replica := range replicas {
+				if replica.ProviderAccountID == candidate.ProviderAccountID {
+					return replica, true, nil
+				}
+			}
+		}
+	}
+	return domain.ObjectReplica{}, false, nil
+}
+
 func (s *Store) DeleteObjectReplicas(ctx context.Context, bucket, key string) error {
 	_, err := s.exec(ctx, `DELETE FROM object_replicas WHERE bucket = ? AND key = ?`, bucket, key)
 	return err
@@ -677,6 +729,39 @@ func (s *Store) ListProviderBucketUsage(ctx context.Context) ([]domain.ProviderB
 func (s *Store) AddProviderUsage(ctx context.Context, providerID string, delta int64) error {
 	_, err := s.exec(ctx, `UPDATE provider_accounts SET used_bytes = CASE WHEN used_bytes + ? < 0 THEN 0 ELSE used_bytes + ? END, updated_at = ? WHERE id = ?`, delta, delta, time.Now().UTC().Format(time.RFC3339Nano), providerID)
 	return err
+}
+
+func (s *Store) CreateAuditEvent(ctx context.Context, event domain.AuditEvent) error {
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.exec(ctx, `
+INSERT INTO audit_events (id, actor, action, bucket, key, target_id, detail, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`, event.ID, event.Actor, event.Action, event.Bucket, event.Key, event.TargetID, event.Detail, event.CreatedAt.Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]domain.AuditEvent, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.query(ctx, `SELECT id, actor, action, bucket, key, target_id, detail, created_at FROM audit_events ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.AuditEvent
+	for rows.Next() {
+		var event domain.AuditEvent
+		var created string
+		if err := rows.Scan(&event.ID, &event.Actor, &event.Action, &event.Bucket, &event.Key, &event.TargetID, &event.Detail, &created); err != nil {
+			return nil, err
+		}
+		event.CreatedAt = parseOptionalTime(created)
+		out = append(out, event)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) CreateMultipartUpload(ctx context.Context, upload domain.MultipartUpload) error {

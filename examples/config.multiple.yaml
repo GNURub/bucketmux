@@ -1,6 +1,7 @@
 server:
   addr: ":8080"
   data_dir: "/data"
+  public_base_url: "http://localhost:8080"
   master_key: "change-me-use-MASTER_KEY-env"
 
 store:
@@ -9,6 +10,13 @@ store:
     dsn: "postgres://bucketmux:bucketmux@postgres:5432/bucketmux?sslmode=disable"
     max_open_conns: 25
     max_idle_conns: 10
+
+coordination:
+  kind: "redis"
+  redis:
+    addr: "redis:6379"
+    key_prefix: "bucketmux"
+    lease_ttl_seconds: 5
 
 s3:
   access_key: "local-access-key"

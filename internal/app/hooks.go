@@ -294,15 +294,24 @@ func (s *Service) ListHooksForAdmin(ctx context.Context) ([]domain.Hook, error) 
 func (s *Service) StartHookDeliveryWorker(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	_ = s.ProcessPendingHookDeliveries(ctx, 50)
+	s.processPendingHookDeliveriesWithLease(ctx, 50)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = s.ProcessPendingHookDeliveries(ctx, 50)
+			s.processPendingHookDeliveriesWithLease(ctx, 50)
 		}
 	}
+}
+
+func (s *Service) processPendingHookDeliveriesWithLease(ctx context.Context, limit int) {
+	lease, ok := s.tryWorkerLease(ctx, "hooks")
+	if !ok {
+		return
+	}
+	defer lease.Release(ctx)
+	_ = s.ProcessPendingHookDeliveries(ctx, limit)
 }
 
 func (s *Service) ProcessPendingHookDeliveries(ctx context.Context, limit int) error {

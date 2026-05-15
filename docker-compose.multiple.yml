@@ -14,6 +14,13 @@ services:
       retries: 20
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - bucketmux-redis:/data
+    restart: unless-stopped
+
   bucketmux-a:
     build: .
     image: bucketmux:local
@@ -29,12 +36,17 @@ services:
       POSTGRES_DSN: postgres://bucketmux:${BUCKETMUX_POSTGRES_PASSWORD:-bucketmux}@postgres:5432/bucketmux?sslmode=disable
       POSTGRES_MAX_OPEN_CONNS: 25
       POSTGRES_MAX_IDLE_CONNS: 10
+      COORDINATION_KIND: redis
+      REDIS_ADDR: redis:6379
+      REDIS_KEY_PREFIX: bucketmux
     volumes:
       - ./examples/config.multiple.yaml:/config/config.yaml:ro
       - bucketmux-a-data:/data
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
     expose:
       - "8080"
     restart: unless-stopped
@@ -50,6 +62,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
     expose:
       - "8080"
     restart: unless-stopped
@@ -67,5 +81,6 @@ services:
 
 volumes:
   bucketmux-postgres:
+  bucketmux-redis:
   bucketmux-a-data:
   bucketmux-b-data:

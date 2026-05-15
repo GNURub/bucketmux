@@ -65,3 +65,20 @@ func TestDBPathEnvOverridesLegacyAndSQLitePath(t *testing.T) {
 		t.Fatalf("Server.DBPath=%q Store.SQLite.Path=%q", cfg.Server.DBPath, cfg.Store.SQLite.Path)
 	}
 }
+
+func TestCoordinationRedisConfigFromEnv(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("COORDINATION_KIND", "redis")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("REDIS_DB", "2")
+	t.Setenv("REDIS_KEY_PREFIX", "bucketmux-test")
+	t.Setenv("REDIS_LEASE_TTL_SECONDS", "9")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Coordination.Kind != "redis" || cfg.Coordination.Redis.Addr != "redis:6379" || cfg.Coordination.Redis.DB != 2 || cfg.Coordination.Redis.KeyPrefix != "bucketmux-test" || cfg.Coordination.Redis.LeaseTTLSeconds != 9 {
+		t.Fatalf("coordination config = %+v", cfg.Coordination)
+	}
+}

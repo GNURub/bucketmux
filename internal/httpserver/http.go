@@ -16,6 +16,10 @@ func NewHTTPHandler(svc *app.Service) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "time": time.Now().UTC().Format(time.RFC3339)})
 	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		_, _ = w.Write([]byte(svc.PrometheusMetrics(r.Context())))
+	})
 	mux.Handle("/uppy/s3/", gateway.NewUppyHandler(svc))
 	if svc.Config.Admin.Enabled {
 		mux.Handle("/admin", admin.NewHandler(svc))

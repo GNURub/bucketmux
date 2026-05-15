@@ -54,6 +54,24 @@ func TestPlacementRouterChoose(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name:      "skips provider policy max object size",
+			inputSize: 20,
+			providers: []domain.ProviderAccount{
+				{ID: "small-only", Priority: 1, CapacityBytes: 100, Enabled: true, Settings: map[string]string{"max_object_size_bytes": "10"}},
+				{ID: "large-ok", Priority: 10, CapacityBytes: 100, Enabled: true},
+			},
+			wantID: "large-ok",
+		},
+		{
+			name:      "uses lower cost as priority tie breaker",
+			inputSize: 10,
+			providers: []domain.ProviderAccount{
+				{ID: "expensive", Priority: 1, CapacityBytes: 100, Enabled: true, Settings: map[string]string{"cost_per_gb_month": "9"}},
+				{ID: "cheap", Priority: 1, CapacityBytes: 100, Enabled: true, Settings: map[string]string{"cost_per_gb_month": "1"}},
+			},
+			wantID: "cheap",
+		},
 	}
 
 	for _, tt := range tests {

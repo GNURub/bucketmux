@@ -125,8 +125,13 @@ func (h *Handler) index(w http.ResponseWriter, r *http.Request, message string) 
 		writeProblem(w, http.StatusInternalServerError, "store-error", err.Error())
 		return
 	}
+	auditEvents, err := h.svc.Store.ListAuditEvents(r.Context(), 10)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "store-error", err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = indexTemplate.Execute(w, adminPageData{Providers: providers, Buckets: buckets, Usage: usage, Hooks: hooks, HookDeliveries: deliveries, ProviderHealth: health, MigrationJobs: migrations, TotalBytes: totalUsageBytes(usage), Message: message})
+	_ = indexTemplate.Execute(w, adminPageData{Providers: providers, Buckets: buckets, Usage: usage, Hooks: hooks, HookDeliveries: deliveries, ProviderHealth: health, MigrationJobs: migrations, AuditEvents: auditEvents, TotalBytes: totalUsageBytes(usage), Message: message})
 }
 
 func (h *Handler) uploadObjectFromForm(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +213,15 @@ func (h *Handler) createProviderFromForm(w http.ResponseWriter, r *http.Request)
 	if storeID := strings.TrimSpace(r.FormValue("settings_vercel_store_id")); storeID != "" {
 		settings["store_id"] = storeID
 	}
+	if cost := strings.TrimSpace(r.FormValue("settings_cost_per_gb_month")); cost != "" {
+		settings["cost_per_gb_month"] = cost
+	}
+	if maxObjectSize := strings.TrimSpace(r.FormValue("settings_max_object_size_bytes")); maxObjectSize != "" {
+		settings["max_object_size_bytes"] = maxObjectSize
+	}
+	if minFree := strings.TrimSpace(r.FormValue("settings_min_free_bytes")); minFree != "" {
+		settings["min_free_bytes"] = minFree
+	}
 	account := domain.ProviderAccount{
 		ID:            strings.TrimSpace(r.FormValue("id")),
 		Name:          strings.TrimSpace(r.FormValue("name")),
@@ -240,6 +254,7 @@ func (h *Handler) deleteProviderFromForm(w http.ResponseWriter, r *http.Request,
 		h.index(w, r, "Could not delete provider: "+err.Error())
 		return
 	}
+	h.svc.RecordAuditEvent(r.Context(), domain.AuditEvent{Actor: app.AuditActorFromRequest(r), Action: domain.AuditActionProviderDeleted, TargetID: id})
 	h.redirectHome(w, r)
 }
 
@@ -270,6 +285,7 @@ func (h *Handler) deleteHookFromForm(w http.ResponseWriter, r *http.Request, id 
 		h.index(w, r, "Could not delete hook: "+err.Error())
 		return
 	}
+	h.svc.RecordAuditEvent(r.Context(), domain.AuditEvent{Actor: app.AuditActorFromRequest(r), Action: domain.AuditActionHookDeleted, TargetID: id})
 	h.redirectHome(w, r)
 }
 
@@ -334,6 +350,7 @@ func (h *Handler) providerByID(w http.ResponseWriter, r *http.Request, id string
 		writeProblem(w, http.StatusInternalServerError, "provider-delete-failed", err.Error())
 		return
 	}
+	h.svc.RecordAuditEvent(r.Context(), domain.AuditEvent{Actor: app.AuditActorFromRequest(r), Action: domain.AuditActionProviderDeleted, TargetID: id})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -372,6 +389,7 @@ func (h *Handler) hookByID(w http.ResponseWriter, r *http.Request, id string) {
 		writeProblem(w, http.StatusInternalServerError, "hook-delete-failed", err.Error())
 		return
 	}
+	h.svc.RecordAuditEvent(r.Context(), domain.AuditEvent{Actor: app.AuditActorFromRequest(r), Action: domain.AuditActionHookDeleted, TargetID: id})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -442,6 +460,9 @@ func (h *Handler) migrations(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeProblem(w, http.StatusBadRequest, "migration-create-failed", err.Error())
 			return
+		}
+		if job.Mode == domain.MigrationModeMove {
+			h.svc.RecordAuditEvent(r.Context(), domain.AuditEvent{Actor: app.AuditActorFromRequest(r), Action: domain.AuditActionMigrationMove, Bucket: job.Bucket, Key: job.Prefix, TargetID: job.TargetProviderID, Detail: job.ID})
 		}
 		writeJSON(w, http.StatusCreated, job)
 	default:
@@ -519,6 +540,7 @@ func (h *Handler) deleteAdminObject(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "object-delete-failed", err.Error())
 		return
 	}
+	h.svc.RecordAuditEvent(r.Context(), domain.AuditEvent{Actor: app.AuditActorFromRequest(r), Action: domain.AuditActionObjectDeleted, Bucket: req.Bucket, Key: req.Key})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "bucket": req.Bucket, "key": req.Key})
 }
 
@@ -543,7 +565,7 @@ func (h *Handler) presignObjectURL(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusNotFound, "object-not-found", "object not found")
 		return
 	}
-	target, err := url.Parse(adminPublicBaseURL(r) + "/" + url.PathEscape(bucket) + "/" + escapeS3Key(key))
+	target, err := url.Parse(h.adminPublicBaseURL(r) + "/" + url.PathEscape(bucket) + "/" + escapeS3Key(key))
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "url-build-failed", err.Error())
 		return
@@ -758,6 +780,7 @@ type adminPageData struct {
 	HookDeliveries []domain.HookDelivery
 	ProviderHealth []domain.ProviderHealth
 	MigrationJobs  []domain.MigrationJob
+	AuditEvents    []domain.AuditEvent
 	TotalBytes     int64
 	Message        string
 }
@@ -838,6 +861,14 @@ func adminPublicBaseURL(r *http.Request) string {
 		host = r.Host
 	}
 	return proto + "://" + host
+}
+
+func (h *Handler) adminPublicBaseURL(r *http.Request) string {
+	configured := strings.TrimRight(strings.TrimSpace(h.svc.Config.Server.PublicBaseURL), "/")
+	if configured != "" {
+		return configured
+	}
+	return adminPublicBaseURL(r)
 }
 
 func escapeS3Key(key string) string {
@@ -1210,6 +1241,27 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
             </table>
           </div>
         </section>
+
+        <section class="card">
+          <div class="card-header"><div><h2 class="card-title">Audit log</h2><p class="card-desc">Operaciones destructivas y de movimiento iniciadas desde el admin.</p></div></div>
+          <div class="card-body table-wrap">
+            {{if .AuditEvents}}
+            <table class="table">
+              <thead><tr><th>Action</th><th>Target</th><th>Actor</th><th>Detail</th></tr></thead>
+              <tbody>
+              {{range .AuditEvents}}
+                <tr>
+                  <td><span class="pill failed">{{.Action}}</span><span class="sub">{{.CreatedAt.Format "2006-01-02 15:04:05 UTC"}}</span></td>
+                  <td><span class="mono">{{.Bucket}}/{{.Key}}</span><span class="sub">{{.TargetID}}</span></td>
+                  <td><span class="mono">{{.Actor}}</span></td>
+                  <td><span class="sub">{{.Detail}}</span></td>
+                </tr>
+              {{end}}
+              </tbody>
+            </table>
+            {{else}}<div class="empty">No destructive admin operations recorded yet.</div>{{end}}
+          </div>
+        </section>
       </div>
 
       <aside class="stack">
@@ -1258,6 +1310,9 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
             <label>Cloudinary cloud_name<input name="settings_cloud_name" placeholder="my-cloud"></label>
             <label>Vercel Blob access <span class="hint">kind=vercel-blob; public or private</span><input name="settings_vercel_access" placeholder="public"></label>
             <label>Vercel Blob store_id <span class="hint">optional if token includes it</span><input name="settings_vercel_store_id" placeholder="store-id"></label>
+            <label>Cost per GB/month <span class="hint">policy: lower cost wins on priority tie</span><input name="settings_cost_per_gb_month" placeholder="0.015"></label>
+            <label>Max object size bytes <span class="hint">policy: skip provider for larger objects</span><input name="settings_max_object_size_bytes" type="number" placeholder="104857600"></label>
+            <label>Min free bytes <span class="hint">policy: reserve capacity headroom</span><input name="settings_min_free_bytes" type="number" placeholder="1073741824"></label>
             <label class="checkbox"><input type="checkbox" name="enabled" checked> Enabled</label>
           </div>
           <div class="actions"><button class="btn" type="submit">Save provider</button><button class="btn secondary" type="reset">Reset</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
