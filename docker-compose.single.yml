@@ -1,0 +1,24 @@
+services:
+  bucketmux:
+    build: .
+    image: bucketmux:local
+    container_name: bucketmux-single
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_PATH: /config/config.yaml
+      MASTER_KEY: ${BUCKETMUX_MASTER_KEY:-replace-with-a-long-random-secret}
+      S3_ACCESS_KEY: ${BUCKETMUX_S3_ACCESS_KEY:-local-access-key}
+      S3_SECRET_KEY: ${BUCKETMUX_S3_SECRET_KEY:-local-secret-key}
+      ADMIN_ENABLED: "true"
+      ADMIN_USER: ${BUCKETMUX_ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${BUCKETMUX_ADMIN_PASSWORD:-change-me}
+      STORE_KIND: sqlite
+      SQLITE_PATH: /data/switcher.db
+    volumes:
+      - ./examples/config.single.yaml:/config/config.yaml:ro
+      - bucketmux-data:/data
+    restart: unless-stopped
+
+volumes:
+  bucketmux-data:

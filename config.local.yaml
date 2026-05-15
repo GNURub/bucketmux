@@ -1,0 +1,42 @@
+server:
+  addr: ":8089"
+  data_dir: "./data"
+  # Deprecated but still supported for SQLite. Prefer store.sqlite.path.
+  db_path: "./data/switcher.db"
+  # Prefer MASTER_KEY env var in production. This local file is only for development.
+  master_key: "replace-with-a-long-random-secret"
+
+store:
+  kind: "sqlite"
+  sqlite:
+    path: "./data/switcher.db"
+  postgres:
+    dsn: "postgres://bucketmux:bucketmux@localhost:5432/bucketmux?sslmode=disable"
+    max_open_conns: 25
+    max_idle_conns: 10
+
+s3:
+  access_key: "local-access-key"
+  secret_key: "local-secret-key"
+  region: "auto"
+
+admin:
+  enabled: true
+  username: "admin"
+  password: "change-me"
+
+buckets:
+  - name: "images"
+    replication_enabled: false
+    replication_provider_ids: []
+
+providers:
+  - id: "local-default"
+    name: "Local hard-drive storage"
+    kind: "local"
+    bucket: "images"
+    capacity_bytes: 10737418240
+    priority: 100
+    enabled: true
+    settings:
+      path: "./data/local-provider"

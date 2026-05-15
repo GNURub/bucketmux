@@ -1,0 +1,69 @@
+package store
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/gnurub/bucketmux/internal/config"
+	"github.com/gnurub/bucketmux/internal/domain"
+)
+
+func TestRebindPostgresPlaceholders(t *testing.T) {
+	s := &Store{dialect: dialectPostgres}
+	got := s.rebind("SELECT * FROM objects WHERE bucket = ? AND key > ? LIMIT ?")
+	want := "SELECT * FROM objects WHERE bucket = $1 AND key > $2 LIMIT $3"
+	if got != want {
+		t.Fatalf("rebind() = %q, want %q", got, want)
+	}
+}
+
+func TestPostgresStoreIntegration(t *testing.T) {
+	if os.Getenv("BUCKETMUX_RUN_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set BUCKETMUX_RUN_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("POSTGRES_DSN is required")
+	}
+	s, err := OpenPostgres(config.PostgresStoreConfig{DSN: dsn, MaxOpenConns: 5, MaxIdleConns: 2})
+	if err != nil {
+		t.Fatalf("OpenPostgres() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	suffix := time.Now().UTC().Format("20060102150405")
+	providerID := "pg-provider-" + suffix
+	bucketName := "pg-bucket-" + suffix
+	key := "objects/demo.txt"
+
+	if err := s.UpsertProvider(ctx, domain.ProviderAccount{ID: providerID, Name: providerID, Kind: domain.ProviderKindLocal, Bucket: bucketName, CapacityBytes: 1024, Enabled: true, Settings: map[string]string{"path": "/tmp"}}); err != nil {
+		t.Fatalf("UpsertProvider() error = %v", err)
+	}
+	if err := s.UpsertBucket(ctx, domain.Bucket{Name: bucketName, ReplicationEnabled: true, ReplicationProviderIDs: []string{providerID}}); err != nil {
+		t.Fatalf("UpsertBucket() error = %v", err)
+	}
+	bucket, err := s.GetBucket(ctx, bucketName)
+	if err != nil || len(bucket.ReplicationProviderIDs) != 1 {
+		t.Fatalf("GetBucket() = %+v, %v", bucket, err)
+	}
+	obj := domain.ObjectRecord{Bucket: bucketName, Key: key, ProviderAccountID: providerID, RemoteBucket: bucketName, RemoteKey: key, Size: 4, ReplicaStatus: "none"}
+	if err := s.PutObject(ctx, obj); err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+	if _, err := s.GetObject(ctx, bucketName, key); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	}
+	if err := s.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: bucketName, Key: key, ProviderAccountID: providerID, Status: "succeeded"}); err != nil {
+		t.Fatalf("UpsertObjectReplica() error = %v", err)
+	}
+	hookID := "pg-hook-" + suffix
+	if err := s.UpsertHook(ctx, domain.Hook{ID: hookID, Name: hookID, Kind: domain.HookKindHTTP, URL: "https://example.com/hook", Method: "POST", Events: []string{domain.HookEventObjectCreated}, Enabled: true}); err != nil {
+		t.Fatalf("UpsertHook() error = %v", err)
+	}
+	if err := s.CreateHookDelivery(ctx, domain.HookDelivery{ID: "pg-delivery-" + suffix, HookID: hookID, Event: domain.HookEventObjectCreated, Bucket: bucketName, Key: key, PayloadJSON: `{}`, Status: domain.HookDeliveryStatusPending}); err != nil {
+		t.Fatalf("CreateHookDelivery() error = %v", err)
+	}
+}

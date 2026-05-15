@@ -1,0 +1,107 @@
+server:
+  addr: ":8080"
+  data_dir: "/data"
+  # Deprecated but still supported for SQLite. Prefer store.sqlite.path.
+  db_path: "/data/switcher.db"
+  # Prefer MASTER_KEY env var in production.
+  master_key: "change-me-use-a-long-random-secret"
+
+store:
+  kind: "sqlite" # sqlite | postgres
+  sqlite:
+    path: "/data/switcher.db"
+  postgres:
+    dsn: "postgres://bucketmux:bucketmux@postgres:5432/bucketmux?sslmode=disable"
+    max_open_conns: 25
+    max_idle_conns: 10
+
+s3:
+  access_key: "local-access-key"
+  secret_key: "local-secret-key"
+  region: "auto"
+
+admin:
+  enabled: true
+  username: "admin"
+  password: "change-me"
+
+buckets:
+  - name: "images"
+    replication_enabled: false
+    # Optional: provider IDs where objects in this bucket should be replicated.
+    # Empty or omitted means no replication.
+    replication_provider_ids: []
+
+providers:
+  # Optional local hard-drive provider. Remove this block if you only want remote providers.
+  - id: "local-default"
+    name: "Local hard-drive storage"
+    kind: "local"
+    bucket: "images"
+    capacity_bytes: 10737418240
+    priority: 100
+    enabled: true
+    settings:
+      # Absolute paths are used as-is. Relative paths are resolved under server.data_dir.
+      path: "/data/local-provider"
+
+  # Cloudflare R2 / Backblaze B2 / MinIO / GCS XML API style provider.
+  # - id: "r2-main"
+  #   name: "Cloudflare R2 main"
+  #   kind: "s3-compatible"
+  #   endpoint: "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+  #   region: "auto"
+  #   bucket: "images"
+  #   access_key: "..."
+  #   secret_key: "..."
+  #   capacity_bytes: 10737418240
+  #   priority: 10
+  #   enabled: true
+
+  # SeaweedFS S3 API backend. Start SeaweedFS with:
+  # docker run -p 8333:8333 -e AWS_ACCESS_KEY_ID=admin -e AWS_SECRET_ACCESS_KEY=secret -e S3_BUCKET=images chrislusf/seaweedfs
+  # - id: "seaweedfs-local"
+  #   name: "SeaweedFS local S3"
+  #   kind: "s3-compatible"
+  #   endpoint: "http://localhost:8333"
+  #   region: "us-east-1"
+  #   bucket: "images"
+  #   access_key: "admin"
+  #   secret_key: "secret"
+  #   capacity_bytes: 107374182400
+  #   priority: 20
+  #   enabled: true
+
+  # Vercel Blob provider. Not S3-native; uses the Vercel Blob API adapter.
+  # Use a Vercel BLOB_READ_WRITE_TOKEN as secret_key.
+  # Keep endpoint empty unless you need to override the official API URL.
+  # - id: "vercel-blob-main"
+  #   name: "Vercel Blob main"
+  #   kind: "vercel-blob"
+  #   endpoint: "https://vercel.com/api/blob"
+  #   bucket: "vercel"
+  #   access_key: ""
+  #   secret_key: "vercel_blob_rw_STOREID_SECRET"
+  #   capacity_bytes: 10737418240
+  #   priority: 50
+  #   enabled: true
+  #   settings:
+  #     # public or private. Defaults to public.
+  #     access: "public"
+  #     # Optional if the token contains the store id.
+  #     store_id: "STOREID"
+  #     # Optional cache-control max age in seconds for uploads.
+  #     cache_control_max_age: "2592000"
+
+  # Cloudinary provider. Not S3-native; uses a media API adapter.
+  # - id: "cloudinary-free"
+  #   name: "Cloudinary free"
+  #   kind: "cloudinary"
+  #   bucket: "CLOUD_NAME"
+  #   access_key: "API_KEY"
+  #   secret_key: "API_SECRET"
+  #   capacity_bytes: 1073741824
+  #   priority: 200
+  #   enabled: true
+  #   settings:
+  #     cloud_name: "CLOUD_NAME"

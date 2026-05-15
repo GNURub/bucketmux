@@ -1,0 +1,31 @@
+server:
+  addr: ":8080"
+  data_dir: "/data"
+  master_key: "change-me-use-MASTER_KEY-env"
+
+store:
+  kind: "postgres"
+  postgres:
+    dsn: "postgres://bucketmux:bucketmux@postgres:5432/bucketmux?sslmode=disable"
+    max_open_conns: 25
+    max_idle_conns: 10
+
+s3:
+  access_key: "local-access-key"
+  secret_key: "local-secret-key"
+  region: "auto"
+
+admin:
+  enabled: true
+  username: "admin"
+  password: "change-me"
+
+buckets:
+  - name: "images"
+    replication_enabled: false
+    replication_provider_ids: []
+
+# Multi-instance mode should use shared remote providers configured through the admin
+# or added here as s3-compatible providers. Avoid per-instance local providers unless
+# the path is backed by shared storage mounted into every replica.
+providers: []

@@ -1,0 +1,35 @@
+server:
+  addr: ":8080"
+  data_dir: "/data"
+  master_key: "change-me-use-MASTER_KEY-env"
+
+store:
+  kind: "sqlite"
+  sqlite:
+    path: "/data/switcher.db"
+
+s3:
+  access_key: "local-access-key"
+  secret_key: "local-secret-key"
+  region: "auto"
+
+admin:
+  enabled: true
+  username: "admin"
+  password: "change-me"
+
+buckets:
+  - name: "images"
+    replication_enabled: false
+    replication_provider_ids: []
+
+providers:
+  - id: "local-default"
+    name: "Local Docker volume"
+    kind: "local"
+    bucket: "images"
+    capacity_bytes: 10737418240
+    priority: 100
+    enabled: true
+    settings:
+      path: "/data/local-provider"
