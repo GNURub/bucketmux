@@ -1,0 +1,56 @@
+services:
+  bucketmux:
+    build: .
+    environment:
+      CONFIG_PATH: /config/config.yaml
+      MASTER_KEY: 0123456789abcdef0123456789abcdef
+      S3_ACCESS_KEY: imgproxy-access-key
+      S3_SECRET_KEY: imgproxy-secret-key
+      S3_REGION: us-east-1
+      ADMIN_ENABLED: "false"
+    volumes:
+      - ./test/e2e/imgproxy/config.yaml:/config/config.yaml:ro
+      - bucketmux-imgproxy-data:/data
+    ports:
+      - "127.0.0.1:${BUCKETMUX_IMGPROXY_PORT:-18080}:8080"
+    healthcheck:
+      interval: 2s
+      timeout: 2s
+      start_period: 2s
+      retries: 30
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  imgproxy:
+    image: ghcr.io/imgproxy/imgproxy:v4.0.14@sha256:595fb82df2364e35711e4303c6de6ad412bbd93963db47be58354a4d52dd1f17
+    environment:
+      IMGPROXY_USE_S3: "true"
+      IMGPROXY_S3_ENDPOINT: http://bucketmux:8080
+      IMGPROXY_S3_ENDPOINT_USE_PATH_STYLE: "true"
+      IMGPROXY_S3_REGION: us-east-1
+      IMGPROXY_S3_ALLOWED_BUCKETS: images
+      IMGPROXY_ALLOWED_SOURCES: s3://
+      AWS_ACCESS_KEY_ID: imgproxy-access-key
+      AWS_SECRET_ACCESS_KEY: imgproxy-secret-key
+      AWS_EC2_METADATA_DISABLED: "true"
+      IMGPROXY_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      IMGPROXY_SALT: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+    depends_on:
+      bucketmux:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${IMGPROXY_PORT:-18081}:8080"
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      interval: 2s
+      timeout: 2s
+      start_period: 2s
+      retries: 30
+
+volumes:
+  bucketmux-imgproxy-data:

@@ -8,7 +8,7 @@ It is designed for small teams, side projects, prototypes and cost-conscious dep
 
 BucketMux is **not a SaaS**. You run it as your own Docker container, configure your own provider credentials, and keep the object index and encrypted secrets under your control.
 
-> Status: active MVP. BucketMux implements a practical Core S3 surface, not every AWS S3 feature.
+> Status: production-ready baseline for the documented Core S3 surface. BucketMux is not a complete AWS S3 implementation; deploy only against the compatibility scope and operational requirements documented below.
 
 ---
 
@@ -54,8 +54,14 @@ BucketMux exposes a path-style S3-compatible API:
 - `DELETE /{bucket}/{key}`
 - `GET /{bucket}?list-type=2&prefix=...`
 - multipart upload flow
+- browser-compatible presigned POST policies
 - SigV4 header authentication
 - SigV4 presigned URLs
+- copy object and multi-object delete
+- object metadata and tags
+- conditional reads/writes
+- versioning, delete markers, retention and legal hold
+- bucket notification configuration backed by durable HTTP deliveries
 - range reads
 - CORS support for browser uploads
 
@@ -95,7 +101,7 @@ The optional embedded admin can be disabled completely. When enabled, it provide
 - upload object dialog
 - object browser
 - public presigned URL generation
-- safe object deletion requiring the exact confirmation phrase `Eliminar permanentemente`
+- safe object deletion requiring the exact confirmation phrase `Delete permanently`
 - provider health checks
 - usage by provider and bucket
 - migration jobs by bucket/prefix with progress history
@@ -103,6 +109,15 @@ The optional embedded admin can be disabled completely. When enabled, it provide
 - HTTP hooks/webhooks
 - secret webhook headers
 - delivery history and retry visibility
+- provider connection tests, remote bucket discovery and inventory import/reconciliation
+- scoped and expiring S3 access keys with rotation
+- OIDC Authorization Code + PKCE login with optional group allowlist
+- recoverable trash, lifecycle rules, Object Lock controls and object versions
+- durable integrity scans that restore damaged primaries from replicas
+- placement simulation and storage cost recommendations
+- declarative admin API, OpenAPI document and `bucketmux admin` CLI
+
+Inventory jobs keep the logical BucketMux bucket separate from the remote provider bucket. This allows an existing bucket such as `company-production-assets` to be imported into a concise logical bucket such as `assets` without renaming provider data.
 
 ### Presigned public access
 
@@ -214,8 +229,15 @@ docker run --rm -p 8080:8080 \
   -v "$PWD/config.yaml:/config/config.yaml:ro" \
   -e CONFIG_PATH=/config/config.yaml \
   -e MASTER_KEY="replace-with-a-long-random-secret" \
+  -e S3_ACCESS_KEY="replace-with-a-unique-access-key" \
+  -e S3_SECRET_KEY="replace-with-a-long-random-secret-key" \
   bucketmux
 ```
+
+The container image does not embed an active configuration or default credentials. It exits immediately unless `MASTER_KEY`, `S3_ACCESS_KEY`, and `S3_SECRET_KEY` are supplied directly or by a mounted configuration file.
+Its runtime is `scratch` (no shell or package manager), runs as UID/GID 10001,
+and exposes a built-in healthcheck. If the service listens somewhere other than
+the default `:8080`, set `HEALTHCHECK_URL` to its internal `/readyz` URL.
 
 ### 4. Run with Docker Compose
 
@@ -225,7 +247,10 @@ Single instance with SQLite and a local-disk provider:
 
 ```bash
 BUCKETMUX_MASTER_KEY="replace-with-a-long-random-secret" \
-BUCKETMUX_ADMIN_PASSWORD="change-me" \
+BUCKETMUX_S3_ACCESS_KEY="replace-with-a-unique-access-key" \
+BUCKETMUX_S3_SECRET_KEY="replace-with-a-long-random-secret-key" \
+BUCKETMUX_ADMIN_USER="admin" \
+BUCKETMUX_ADMIN_PASSWORD="replace-with-a-long-random-password" \
 docker compose -f docker-compose.single.yml up --build
 ```
 
@@ -239,8 +264,12 @@ Multi-instance example with two BucketMux replicas, shared Postgres state and an
 
 ```bash
 BUCKETMUX_MASTER_KEY="replace-with-a-long-random-secret" \
-BUCKETMUX_POSTGRES_PASSWORD="bucketmux" \
-BUCKETMUX_ADMIN_PASSWORD="change-me" \
+BUCKETMUX_S3_ACCESS_KEY="replace-with-a-unique-access-key" \
+BUCKETMUX_S3_SECRET_KEY="replace-with-a-long-random-secret-key" \
+BUCKETMUX_ADMIN_USER="admin" \
+BUCKETMUX_ADMIN_PASSWORD="replace-with-a-long-random-password" \
+BUCKETMUX_POSTGRES_PASSWORD="replace-with-a-long-random-password" \
+BUCKETMUX_REDIS_PASSWORD="replace-with-a-long-random-password" \
 docker compose -f docker-compose.multiple.yml up --build
 ```
 
@@ -254,7 +283,7 @@ Files:
 | [`examples/config.multiple.yaml`](./examples/config.multiple.yaml) | Compose config for multi-instance mode. |
 | [`examples/nginx.bucketmux.conf`](./examples/nginx.bucketmux.conf) | Nginx proxy config with sticky routing. |
 
-Important multi-instance note: multipart uploads currently stage parts on the instance local `/data` volume before completion. The example Nginx config uses `ip_hash` sticky routing to keep a client on the same backend. For production-grade horizontal scaling, prefer shared object providers and consider shared staging storage or a future distributed multipart coordinator.
+Important multi-instance note: multipart uploads stage parts in `server.multipart_staging_dir`. The Compose example mounts a shared volume at `/multipart`, so an upload can continue after one BucketMux process stops. On multiple hosts, replace that Docker volume with a shared filesystem such as NFS or a ReadWriteMany persistent volume. Completed objects must use shared remote providers; do not configure instance-local providers unless their data path is also shared.
 
 ---
 
@@ -274,6 +303,8 @@ store:
   kind: "sqlite"
   sqlite:
     path: "/data/switcher.db"
+    max_open_conns: 10
+    max_idle_conns: 10
 
 s3:
   access_key: "local-access-key"
@@ -287,6 +318,9 @@ admin:
 
 buckets:
   - name: "images"
+    versioning_enabled: true
+    trash_enabled: true
+    trash_retention_days: 30
 
 providers:
   - id: "local-default"
@@ -312,6 +346,10 @@ Common environment variables:
 | `CONFIG_PATH` | Path to YAML config. |
 | `ADDR` | HTTP listen address. |
 | `DATA_DIR` | Runtime data directory. |
+| `MULTIPART_STAGING_DIR` | Multipart staging directory. Defaults to `${DATA_DIR}/multipart`; it must be shared by all replicas. |
+| `MAX_UPLOAD_BYTES` | Maximum complete object size. Defaults to 5 GiB. |
+| `MAX_MULTIPART_PART_BYTES` | Maximum staged multipart part size. Defaults to 512 MiB. |
+| `MAX_ADMIN_BODY_BYTES` | Maximum non-upload admin mutation body. Defaults to 1 MiB. |
 | `PUBLIC_BASE_URL` | External base URL used when the admin generates public presigned links behind a reverse proxy. |
 | `MASTER_KEY` | Secret used to encrypt stored provider credentials. |
 | `S3_ACCESS_KEY` | Gateway access key. |
@@ -320,8 +358,17 @@ Common environment variables:
 | `ADMIN_ENABLED` | Enable embedded admin. |
 | `ADMIN_USER` | Admin Basic Auth user. |
 | `ADMIN_PASSWORD` | Admin Basic Auth password. |
+| `ADMIN_OIDC_ENABLED` | Enable OpenID Connect admin login. |
+| `ADMIN_OIDC_ISSUER_URL` | OIDC issuer URL used for discovery. |
+| `ADMIN_OIDC_CLIENT_ID` | OIDC client ID. |
+| `ADMIN_OIDC_CLIENT_SECRET` | OIDC client secret. |
+| `ADMIN_OIDC_REDIRECT_URL` | Absolute `/admin/oidc/callback` URL registered with the identity provider. |
+| `ADMIN_OIDC_ALLOWED_GROUPS` | Optional comma-separated group allowlist. |
+| `ADMIN_OIDC_SESSION_HOURS` | Encrypted admin session duration. Defaults to 8 hours. |
 | `STORE_KIND` | `sqlite` or `postgres`. |
 | `SQLITE_PATH` | SQLite database path. |
+| `SQLITE_MAX_OPEN_CONNS` | Maximum open SQLite connections. Defaults to the mixed-workload-tested value `10`. |
+| `SQLITE_MAX_IDLE_CONNS` | Maximum idle SQLite connections. Defaults to `10`. |
 | `POSTGRES_DSN` | Postgres connection string. |
 | `POSTGRES_MAX_OPEN_CONNS` | Max open Postgres connections. |
 | `POSTGRES_MAX_IDLE_CONNS` | Max idle Postgres connections. |
@@ -516,7 +563,9 @@ Do not enable virtual-hosted style unless you also configure DNS for bucket subd
 
 ## Uppy integration
 
-BucketMux exposes helper endpoints under:
+BucketMux is compatibility-tested with `@uppy/core` 6.0.0 and
+`@uppy/aws-s3` 6.0.0 in a real Chromium browser. It exposes signing helpers
+under:
 
 ```text
 /uppy/s3/*
@@ -524,6 +573,7 @@ BucketMux exposes helper endpoints under:
 
 Supported flows:
 
+- the Uppy 6 `signRequest` contract through `POST /uppy/s3/sign`,
 - direct upload parameters,
 - multipart create,
 - multipart part signing,
@@ -532,6 +582,125 @@ Supported flows:
 - multipart abort.
 
 The gateway also returns browser-friendly CORS headers and exposes `ETag`.
+
+Configure Uppy 6 with a signing callback:
+
+```js
+import Uppy from '@uppy/core'
+import AwsS3 from '@uppy/aws-s3'
+
+const uppy = new Uppy().use(AwsS3, {
+  shouldUseMultipart: (file) => file.size > 100 * 1024 * 1024,
+  generateObjectKey: (file) => `uploads/${crypto.randomUUID()}-${file.name}`,
+  async signRequest(request) {
+    const response = await fetch('/api/uploads/sign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...request, bucket: 'images', expiresIn: 300 }),
+    })
+    if (!response.ok) throw new Error(`signing failed: ${response.status}`)
+    return response.json()
+  },
+})
+```
+
+`/api/uploads/sign` should be an authenticated application endpoint or reverse
+proxy that forwards the JSON request to BucketMux `/uppy/s3/sign` and adds the
+`X-S3LS-Access-Key` and `X-S3LS-Secret-Key` headers server-side. Never embed
+permanent BucketMux credentials in a public browser bundle.
+
+The certification test installs the pinned official npm packages, runs direct
+and two-part multipart uploads through BucketMux into MiniStack, downloads both
+objects, and compares every byte. Run it with `make test-uppy`.
+
+### imgproxy compatibility
+
+BucketMux is compatibility-certified with `imgproxy` 4.0.14 using imgproxy's
+[native S3 image source](https://docs.imgproxy.net/image_sources/amazon_s3). The automated test runs both services in containers and
+verifies:
+
+1. upload and byte-identical retrieval of a generated PNG through BucketMux,
+2. an AWS SigV4 `GetObject` issued by imgproxy against BucketMux's path-style endpoint,
+3. a signed imgproxy transformation URL,
+4. a real resize from 8x6 to 4x3 pixels with valid `image/png` output.
+
+The test pins the official multi-architecture imgproxy image by version and
+digest. Run the same certification used by CI with `make test-imgproxy`.
+
+Production imgproxy configuration should set `IMGPROXY_USE_S3=true`, point
+`IMGPROXY_S3_ENDPOINT` to BucketMux, keep path-style endpoints enabled, restrict
+`IMGPROXY_S3_ALLOWED_BUCKETS`, and use strong `IMGPROXY_KEY` and
+`IMGPROXY_SALT` values for signed transformation URLs.
+
+### Native Fetch and presigned multipart
+
+BucketMux also runs an independent Chromium E2E using only the browser's native
+`window.fetch()` API. It requests a separate presigned URL for every data-plane
+operation:
+
+1. create the multipart upload,
+2. upload two parts and read their exposed `ETag` headers,
+3. list and validate the staged parts,
+4. complete the upload,
+5. download and compare every byte,
+6. delete the object and confirm that a subsequent presigned GET returns `404`.
+
+All those requests use SigV4 query-string signatures; permanent credentials are
+sent only to the test signer. Run this flow with `make test-fetch`.
+
+### Provider migration E2E
+
+The migration certification starts two independent MiniStack instances plus a
+real temporary local-disk provider. It uploads six source objects through the
+gateway, then exercises every direction through both the admin API and the real
+admin UI in Chromium:
+
+- S3-like to S3-like,
+- local disk to S3-like,
+- S3-like to local disk.
+
+Every job uses `move` mode. The test waits for `completed`, validates the job
+counters, downloads and byte-compares the migrated object, checks the metadata
+now points at the target provider, confirms the physical target exists, and
+confirms the physical source was deleted. Run it with `make test-migration`.
+
+### Multi-instance user-journey E2E
+
+`make test-multi-instance` starts two real BucketMux processes backed by shared
+Postgres, Redis coordination, shared multipart staging and two independent
+MiniStack S3 providers, with Nginx in front. The browser/API certification verifies:
+
+- upload on one replica followed by GET, HEAD, range and list on the other,
+- bucket creation shared between replicas and a presigned GET through the proxy,
+- multipart creation and first part on one process, followed by process shutdown, second part and completion on the other process,
+- admin UI upload, object browsing, public URL access and confirmed deletion,
+- asynchronous replication followed by a forced primary-provider outage and a verified read from the replica provider,
+- a custom-format `pg_dump`, restore into a new database and object retrieval through a fresh BucketMux process,
+- continued reads while each BucketMux process is stopped and restarted in turn.
+
+The replicas deliberately use separate local `/data` volumes and one shared
+multipart volume. Ordinary completed objects remain portable through shared
+Postgres and remote storage, while in-progress multipart uploads survive process
+failover through the shared staging directory.
+
+### k6 performance regression
+
+The pinned Grafana k6 workload exercises BucketMux over real HTTP with a local
+disk provider and SQLite. Its steady-state mix is 50% GET, 30% HEAD, 10% object
+listing, and 10% complete PUT/GET/DELETE lifecycles using 4 KiB objects. It
+checks response codes and downloaded byte counts and fails on more than 1%
+errors or when these local-gateway latency budgets are exceeded:
+
+- GET and HEAD: p95 below 50 ms and p99 below 100 ms,
+- PUT and DELETE: p95 below 100 ms and p99 below 200 ms,
+- LIST: p95 below 100 ms and p99 below 200 ms.
+
+Run the default 20-VU, 30-second workload with `make test-k6`. Override it with,
+for example, `K6_VUS=50 K6_DURATION=2m make test-k6`. The runner uses an
+installed `k6` binary when available and otherwise runs the pinned
+`grafana/k6:2.2.0` image. These thresholds detect regressions in the gateway;
+they are not a substitute for capacity testing with production hardware and
+remote providers.
 
 ---
 
@@ -545,7 +714,7 @@ BucketMux supports S3-style multipart uploads:
 4. `DELETE /{bucket}/{key}?uploadId=...`
 5. `GET /{bucket}/{key}?uploadId=...`
 
-Multipart parts are staged under `server.data_dir` before completion. Size your Docker volume accordingly.
+Multipart parts are staged under `server.multipart_staging_dir` before completion. It defaults to `${server.data_dir}/multipart`. Size the filesystem for concurrent uploads and mount the same directory on every replica.
 
 ---
 
@@ -564,13 +733,15 @@ buckets:
 
 When an object is uploaded, BucketMux writes the primary object according to placement rules and enqueues replica jobs for the selected providers. Background workers claim pending replicas, copy the object to the target providers and update replica status in the object index.
 
-This keeps uploads fast and makes replication safe for multi-instance deployments.
+This keeps uploads fast. Database claims ensure that one replica job is owned by one worker at a time; interrupted `running` jobs are returned to the queue after the stale-work timeout.
+
+GET and HEAD first use the indexed primary provider. If that provider is unavailable, BucketMux tries completed, enabled replicas and returns the provider actually used in `X-S3LS-Provider-Account`.
 
 ---
 
 ## Coordination and metrics
 
-Background work uses database-backed job claims by default. For high-load multi-instance deployments, enable Redis leases around worker polling:
+Background work uses atomic database-backed claims for ownership. Active jobs heartbeat their database row, and interrupted hook deliveries, migrations, inventories, repairs and replica jobs are recovered from stale `running` state. For high-load multi-instance deployments, Redis can serialize the short claim operation without holding a lease for the duration of provider I/O:
 
 ```yaml
 coordination:
@@ -587,13 +758,15 @@ Prometheus-compatible metrics are exposed at:
 GET /metrics
 ```
 
-The endpoint includes provider usage, capacity, bucket/provider usage, migration job counts and hook delivery counts.
+The endpoint includes provider usage, capacity, bucket/provider usage, migration, inventory and repair job counts, hook delivery counts, recoverable-trash count, and durable-worker failure/success metrics.
+
+HTTP hooks use at-least-once delivery. Every request includes `X-BucketMux-Delivery-ID`; receivers should persist that value and ignore duplicates if processing must be idempotent.
 
 ---
 
 ## Admin API
 
-All admin API endpoints require Basic Auth.
+All admin API endpoints require an authenticated Basic or OIDC admin session.
 
 ```bash
 curl -u admin:change-me http://localhost:8080/admin/api/providers
@@ -610,6 +783,17 @@ Useful endpoints:
 | `POST /admin/api/buckets` | Create or update bucket. |
 | `GET /admin/api/usage` | Storage usage by provider and bucket. |
 | `GET /admin/api/provider-health` | Provider health checks. |
+| `POST /admin/api/providers/{id}/test` | Test provider credentials and connectivity. |
+| `GET /admin/api/providers/{id}/buckets` | Discover remote buckets. |
+| `GET, POST /admin/api/inventory-jobs` | Import or reconcile an existing remote inventory. |
+| `GET, POST /admin/api/repair-jobs` | Run durable integrity and replica repair scans. |
+| `GET, POST /admin/api/access-credentials` | List or create scoped S3 access keys. |
+| `POST /admin/api/access-credentials/{id}/rotate` | Atomically rotate a scoped key. |
+| `GET /admin/api/trash` | List recoverable deleted objects. |
+| `POST /admin/api/trash/{id}/restore` | Restore a recoverable object. |
+| `POST /admin/api/lifecycle/run` | Run lifecycle expiration and trash purge now. |
+| `GET /admin/api/placement-plan` | Simulate placement and projected storage cost. |
+| `GET /admin/api/cost-optimizations` | List estimated provider savings. |
 | `GET /admin/api/hooks` | List hooks. |
 | `POST /admin/api/hooks` | Create or update hook. |
 | `GET /admin/api/hook-deliveries` | Hook delivery history. |
@@ -618,6 +802,8 @@ Useful endpoints:
 | `GET /admin/api/objects` | Browse indexed objects. |
 | `GET /admin/api/objects/presign` | Generate public presigned GET URL. |
 | `DELETE /admin/api/objects` | Delete object after confirmation phrase. |
+| `POST /admin/api/declarative/apply` | Apply providers, buckets and hooks from JSON/YAML through the CLI. |
+| `GET /admin/openapi.json` | Fetch the OpenAPI 3.1 admin contract. |
 
 Delete object safely:
 
@@ -627,8 +813,20 @@ curl -u admin:change-me -X DELETE http://localhost:8080/admin/api/objects \
   -d '{
     "bucket": "images",
     "key": "demo.txt",
-    "confirm": "Eliminar permanentemente"
+    "confirm": "Delete permanently"
   }'
+```
+
+The same read APIs and declarative apply workflow are available from the binary:
+
+```bash
+export BUCKETMUX_ADMIN_URL=http://localhost:8080
+export ADMIN_USER=admin ADMIN_PASSWORD=change-me
+bucketmux admin providers
+bucketmux admin inventory
+bucketmux admin repairs
+bucketmux admin openapi
+bucketmux admin apply desired-state.yaml
 ```
 
 ---
@@ -661,6 +859,8 @@ store:
   kind: "sqlite"
   sqlite:
     path: "/data/switcher.db"
+    max_open_conns: 10
+    max_idle_conns: 10
 ```
 
 Use Postgres when you need stronger concurrency or plan to scale multiple BucketMux instances:
@@ -684,9 +884,53 @@ go test ./internal/store -run TestPostgresStoreIntegration -count=1 -v
 
 ---
 
+## Production operations
+
+### Liveness and readiness
+
+- `GET /healthz` is process liveness only. It stays healthy when a dependency fails, so an orchestrator does not create a restart loop.
+- `GET /readyz` checks the database, coordination backend and writable multipart staging. It returns `503` while the instance must not receive traffic.
+- Provider reachability is visible through `/admin/api/provider-health`; it is not a readiness dependency, because replication and read failover can keep the gateway useful during a provider outage.
+
+The container healthcheck uses `/readyz`. Configure the reverse proxy or load balancer to use the same endpoint.
+
+### PostgreSQL backup and restore
+
+Create a compressed custom-format backup without stopping BucketMux:
+
+```bash
+BACKUP_FILE="./backups/bucketmux-$(date +%Y%m%d-%H%M%S).dump" \
+make backup-postgres
+```
+
+Restore into a new database for validation or disaster recovery:
+
+```bash
+BACKUP_FILE="./backups/bucketmux-20260827-130000.dump" \
+TARGET_DATABASE="bucketmux_restore" \
+make restore-postgres
+```
+
+The restore script refuses to overwrite the configured live database. Database backups contain BucketMux metadata and encrypted credentials, not provider object bytes; enable provider-side versioning/replication or independent backups for the underlying storage. Test restores regularly and protect both the dump and `MASTER_KEY`.
+
+### Deployment checklist
+
+- terminate TLS at a trusted proxy and pass the original `Host` and scheme,
+- generate unique high-entropy master, gateway, admin, database and Redis secrets,
+- use Postgres plus Redis and shared multipart staging for multiple instances,
+- use shared remote object providers in multi-instance mode,
+- keep upload limits aligned between BucketMux and the reverse proxy,
+- send traffic only to `/readyz`-healthy replicas and collect `/metrics`,
+- retain rotated application/proxy logs outside ephemeral containers,
+- schedule PostgreSQL backups and provider-data protection, then rehearse restore,
+- protect the admin route with TLS and preferably a VPN or trusted network,
+- pin and scan the exact image digest promoted to production.
+
+---
+
 ## GitHub Actions Docker image
 
-The repository includes a workflow that builds the Docker image and publishes it to GitHub Container Registry:
+The repository includes a workflow that gates and publishes the Docker image to GitHub Container Registry:
 
 ```text
 .github/workflows/docker-image.yml
@@ -694,10 +938,13 @@ The repository includes a workflow that builds the Docker image and publishes it
 
 Behavior:
 
-- pull requests build the image but do not push it,
-- pushes to `main` or `master` build and push the image,
+- pull requests run tests, the race detector, vet, static analysis, vulnerability scans, MiniStack S3 end-to-end, Uppy 6 in Chromium, native Fetch presigned multipart, provider migrations through the API and UI, multi-instance process/provider failover plus database restore, the k6 performance regression, and an image build without pushing,
+- pushes to `main` or `master` publish only after all quality and security jobs pass,
 - version tags like `v1.2.3` publish semver tags,
 - the default branch also publishes `latest`,
+- published images include provenance and an SBOM attestation,
+- every published image digest is keyless-signed with Sigstore Cosign,
+- Dependabot checks GitHub Actions, Go modules and container images weekly,
 - images are pushed to:
 
 ```text
@@ -712,14 +959,25 @@ docker pull ghcr.io/<owner>/<repo>:latest
 
 The workflow uses GitHub's `GITHUB_TOKEN` with `packages: write`. If the package is not visible after the first push, check the repository/package permissions in GitHub Container Registry.
 
+To prevent merges when CI fails, protect `main` in the GitHub repository ruleset and require these status checks: `Test, race, vet and build`, `Static analysis`, `Vulnerability and image scan`, `MiniStack S3 end-to-end`, `Uppy 6 browser compatibility`, `Fetch presigned multipart`, `imgproxy 4 S3 compatibility`, `Migration API and UI end-to-end`, `Multi-instance HA and restore`, and `k6 performance regression`.
+
 ---
 
 ## Testing
+
+Source builds and quality gates use Go 1.27.0. The version is pinned in
+`.go-version`, `go.mod`, Docker, and GitHub Actions.
 
 Run the full test suite:
 
 ```bash
 make test
+```
+
+Run the same local quality gates used by CI after installing `staticcheck`, `golangci-lint`, and `govulncheck`:
+
+```bash
+make ci
 ```
 
 Or directly:
@@ -732,7 +990,15 @@ Optional integration tests:
 
 ```bash
 make test-bun
+make test-fetch
+make test-imgproxy
+make test-k6
+make test-migration
+make test-ministack
+make test-multi-instance
+make test-uppy
 make test-seaweedfs
+REDIS_ADDR=127.0.0.1:6379 make test-redis
 ```
 
 ---
@@ -752,6 +1018,8 @@ Recommended baseline:
 - back up the database,
 - rotate provider credentials when needed.
 
+BucketMux limits gateway uploads, multipart parts and admin mutation bodies; rejects cross-site admin mutations; uses constant-time Basic Auth comparison; and emits restrictive browser security headers. The production Nginx example also applies request and connection limits. These controls do not replace TLS, network isolation or external abuse monitoring.
+
 BucketMux encrypts provider secrets at rest using `MASTER_KEY`, but anyone with admin access can configure storage behavior. Protect admin credentials accordingly.
 
 ---
@@ -760,24 +1028,26 @@ BucketMux encrypts provider secrets at rest using `MASTER_KEY`, but anyone with 
 
 BucketMux targets practical Core S3 compatibility. It does not aim to be a full AWS S3 clone.
 
-Implemented or partially implemented:
+Implemented and covered by compatibility tests:
 
 - path-style buckets,
-- object put/get/head/delete,
-- list objects v2,
-- multipart upload,
+- object put/get/head/delete, copy and multi-delete,
+- ListObjectsV2 with prefix, delimiter and continuation tokens,
+- multipart upload and browser presigned POST,
 - SigV4 header auth,
 - SigV4 presigned URLs,
 - CORS for browser uploads,
-- range reads.
+- range and conditional reads,
+- metadata and object tags,
+- versioning and delete markers,
+- retention and legal hold,
+- S3-shaped bucket event notification configuration.
 
 Not currently implemented:
 
 - ACLs,
-- bucket policies,
-- lifecycle rules,
-- object versioning,
-- S3 event notifications API,
+- AWS IAM policy documents (BucketMux provides scoped keys and roles instead),
+- provider-native S3 replication configuration,
 - all AWS-specific error edge cases.
 
 ---

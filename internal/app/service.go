@@ -28,18 +28,29 @@ type Service struct {
 	Router    *placement.PlacementRouter
 	Config    config.Config
 
-	Coordinator    coordination.Coordinator
-	WorkerLeaseTTL time.Duration
-	HookHTTPClient *http.Client
-	HookRetryDelay func(attempts int) time.Duration
-	cancelWorkers  context.CancelFunc
-	workerWG       sync.WaitGroup
+	Coordinator     coordination.Coordinator
+	WorkerLeaseTTL  time.Duration
+	HookHTTPClient  *http.Client
+	HookRetryDelay  func(attempts int) time.Duration
+	hookWorkerWake  chan struct{}
+	migrationWake   chan struct{}
+	replicationWake chan struct{}
+	inventoryWake   chan struct{}
+	repairWake      chan struct{}
+	workerState     workerRuntimeState
+	cancelWorkers   context.CancelFunc
+	workerWG        sync.WaitGroup
 }
+
+var ErrUploadTooLarge = errors.New("upload exceeds configured size limit")
 
 func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 	cfg.Normalize()
 	if err := os.MkdirAll(cfg.Server.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	if err := os.MkdirAll(cfg.Server.MultipartStagingDir, 0o750); err != nil {
+		return nil, fmt.Errorf("create multipart staging dir: %w", err)
 	}
 	db, err := store.OpenConfig(cfg.Store, cfg.Server.DBPath)
 	if err != nil {
@@ -72,30 +83,39 @@ func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 		Router: placement.NewPlacementRouter(db),
 		Config: cfg,
 
-		Coordinator:    coordinator,
-		WorkerLeaseTTL: time.Duration(cfg.Coordination.Redis.LeaseTTLSeconds) * time.Second,
-		HookHTTPClient: &http.Client{Timeout: defaultHookTimeout},
-		cancelWorkers:  cancelWorkers,
+		Coordinator:     coordinator,
+		WorkerLeaseTTL:  time.Duration(cfg.Coordination.Redis.LeaseTTLSeconds) * time.Second,
+		HookHTTPClient:  &http.Client{Timeout: defaultHookTimeout},
+		hookWorkerWake:  make(chan struct{}, 1),
+		migrationWake:   make(chan struct{}, 1),
+		replicationWake: make(chan struct{}, 1),
+		inventoryWake:   make(chan struct{}, 1),
+		repairWake:      make(chan struct{}, 1),
+		workerState:     newWorkerRuntimeState(),
+		cancelWorkers:   cancelWorkers,
 	}
 	if err := svc.Bootstrap(ctx, cfg); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	svc.workerWG.Add(1)
-	go func() {
-		defer svc.workerWG.Done()
+	svc.workerWG.Go(func() {
 		svc.StartHookDeliveryWorker(workerCtx)
-	}()
-	svc.workerWG.Add(1)
-	go func() {
-		defer svc.workerWG.Done()
+	})
+	svc.workerWG.Go(func() {
 		svc.StartMigrationWorker(workerCtx)
-	}()
-	svc.workerWG.Add(1)
-	go func() {
-		defer svc.workerWG.Done()
+	})
+	svc.workerWG.Go(func() {
 		svc.StartReplicationWorker(workerCtx)
-	}()
+	})
+	svc.workerWG.Go(func() {
+		svc.StartInventoryWorker(workerCtx)
+	})
+	svc.workerWG.Go(func() {
+		svc.StartRepairWorker(workerCtx)
+	})
+	svc.workerWG.Go(func() {
+		svc.StartLifecycleWorker(workerCtx)
+	})
 	return svc, nil
 }
 
@@ -113,7 +133,40 @@ func (s *Service) Bootstrap(ctx context.Context, cfg config.Config) error {
 			continue
 		}
 		replicationProviderIDs := normalizeProviderIDs(b.ReplicationProviderIDs)
-		if err := s.Store.UpsertBucket(ctx, domain.Bucket{Name: b.Name, ReplicationEnabled: len(replicationProviderIDs) > 0 || b.ReplicationEnabled, ReplicationProviderIDs: replicationProviderIDs}); err != nil {
+		bucket, err := s.Store.GetBucket(ctx, b.Name)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("load bucket %s: %w", b.Name, err)
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			bucket = domain.Bucket{Name: b.Name}
+		}
+		bucket.ReplicationEnabled = len(replicationProviderIDs) > 0 || b.ReplicationEnabled
+		bucket.ReplicationProviderIDs = replicationProviderIDs
+		if b.VersioningEnabled != nil {
+			bucket.VersioningEnabled = *b.VersioningEnabled
+		}
+		if b.TrashEnabled != nil {
+			bucket.TrashEnabled = *b.TrashEnabled
+		}
+		if b.TrashRetentionDays != nil {
+			bucket.TrashRetentionDays = *b.TrashRetentionDays
+		}
+		if b.ObjectLockEnabled != nil {
+			bucket.ObjectLockEnabled = *b.ObjectLockEnabled
+		}
+		if b.DefaultRetentionMode != nil {
+			bucket.DefaultRetentionMode = strings.ToUpper(*b.DefaultRetentionMode)
+		}
+		if b.DefaultRetentionDays != nil {
+			bucket.DefaultRetentionDays = *b.DefaultRetentionDays
+		}
+		if b.LifecycleRules != nil {
+			bucket.LifecycleRules = make([]domain.LifecycleRule, 0, len(b.LifecycleRules))
+			for _, rule := range b.LifecycleRules {
+				bucket.LifecycleRules = append(bucket.LifecycleRules, domain.LifecycleRule{ID: rule.ID, Prefix: rule.Prefix, ExpireAfterDays: rule.ExpireAfterDays, PurgeTrashAfterDays: rule.PurgeTrashAfterDays, Enabled: rule.Enabled})
+			}
+		}
+		if err := s.Store.UpsertBucket(ctx, bucket); err != nil {
 			return fmt.Errorf("bootstrap bucket %s: %w", b.Name, err)
 		}
 	}
@@ -155,16 +208,39 @@ func (s *Service) Bootstrap(ctx context.Context, cfg config.Config) error {
 }
 
 func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, body io.Reader) (domain.ObjectRecord, error) {
+	if input.Size > s.Config.Server.MaxUploadBytes {
+		return domain.ObjectRecord{}, fmt.Errorf("%w: maximum is %d bytes", ErrUploadTooLarge, s.Config.Server.MaxUploadBytes)
+	}
 	bucket, err := s.ensureBucket(ctx, input.Bucket)
 	if err != nil {
 		return domain.ObjectRecord{}, err
+	}
+	existing, existingErr := s.Store.GetObject(ctx, input.Bucket, input.Key)
+	if existingErr == nil {
+		_ = s.Store.HydrateObjectAttributes(ctx, &existing)
+	}
+	if bucket.VersioningEnabled {
+		input.RemoteKey = ".bucketmux/versions/" + randomIdentifier("", 12) + "/" + strings.TrimLeft(input.Key, "/")
+	}
+	if bucket.ObjectLockEnabled && input.RetentionMode == "" && bucket.DefaultRetentionDays > 0 {
+		input.RetentionMode = strings.ToUpper(bucket.DefaultRetentionMode)
+		input.RetainUntil = time.Now().UTC().Add(time.Duration(bucket.DefaultRetentionDays) * 24 * time.Hour)
+	}
+	if (input.RetentionMode != "" || !input.RetainUntil.IsZero() || input.LegalHold) && !bucket.ObjectLockEnabled {
+		return domain.ObjectRecord{}, fmt.Errorf("object lock is not enabled for bucket")
+	}
+	if input.RetentionMode != "" && input.RetentionMode != "GOVERNANCE" && input.RetentionMode != "COMPLIANCE" {
+		return domain.ObjectRecord{}, fmt.Errorf("retention mode must be GOVERNANCE or COMPLIANCE")
+	}
+	if input.RetentionMode != "" && !input.RetainUntil.After(time.Now().UTC()) {
+		return domain.ObjectRecord{}, fmt.Errorf("retain-until date must be in the future")
 	}
 	primary, err := s.Router.Choose(ctx, input, nil)
 	if err != nil {
 		return domain.ObjectRecord{}, err
 	}
 	targets := replicaTargets(bucket, primary.ID)
-	var source io.Reader = body
+	source := io.Reader(body)
 	var cleanup func()
 	if len(targets) > 0 {
 		source, cleanup, err = s.spoolUpload(body)
@@ -191,12 +267,44 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 		ContentType:       stored.ContentType,
 		ETag:              stored.ETag,
 		ChecksumSHA256:    stored.ChecksumSHA256,
+		Metadata:          input.Metadata,
+		Tags:              input.Tags,
+		RetentionMode:     input.RetentionMode,
+		RetainUntil:       input.RetainUntil,
+		LegalHold:         input.LegalHold,
 		ReplicaStatus:     replicaStatus,
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
+	}
+	if bucket.VersioningEnabled {
+		obj.VersionID = randomIdentifier("v-", 12)
+	}
+	if existingErr == nil && bucket.VersioningEnabled {
+		if existing.VersionID == "" {
+			existing.VersionID = "null"
+		}
+		if err := s.Store.PutObjectVersion(ctx, existing); err != nil {
+			return domain.ObjectRecord{}, err
+		}
 	}
 	if err := s.Store.PutObject(ctx, obj); err != nil {
 		return domain.ObjectRecord{}, err
 	}
+	if err := s.Store.PutObjectAttributes(ctx, obj); err != nil {
+		return domain.ObjectRecord{}, err
+	}
+	if bucket.VersioningEnabled {
+		if err := s.Store.PutObjectVersion(ctx, obj); err != nil {
+			return domain.ObjectRecord{}, err
+		}
+	}
 	_ = s.Store.AddProviderUsage(ctx, primary.ID, stored.Size)
+	if existingErr == nil && !bucket.VersioningEnabled {
+		_ = s.cleanupOverwrittenObject(ctx, existing, obj)
+	}
+	if existingErr == nil {
+		s.deleteObjectReplicas(ctx, existing)
+	}
 	if len(targets) > 0 {
 		_ = s.enqueueObjectReplicas(ctx, obj, targets)
 	}
@@ -204,65 +312,140 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 	return obj, nil
 }
 
-func (s *Service) tryWorkerLease(ctx context.Context, name string) (coordination.Lease, bool) {
-	if s.Coordinator == nil {
-		lease, ok, _ := coordination.NoopCoordinator{}.TryAcquire(ctx, name, s.WorkerLeaseTTL)
-		return lease, ok
-	}
-	ttl := s.WorkerLeaseTTL
-	if ttl <= 0 {
-		ttl = 5 * time.Second
-	}
-	lease, ok, err := s.Coordinator.TryAcquire(ctx, name, ttl)
-	if err != nil || !ok {
-		return nil, false
-	}
-	return lease, true
-}
-
 func (s *Service) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, domain.ObjectRecord, error) {
-	obj, err := s.Store.GetObject(ctx, bucket, key)
+	obj, account, err := s.Store.GetObjectWithProvider(ctx, bucket, key)
 	if err != nil {
 		return nil, obj, err
 	}
-	account, adapter, err := s.providerForObject(ctx, obj)
-	if err != nil {
-		return nil, obj, err
+	account, adapter, primaryErr := s.providerForReplica(ctx, account)
+	if primaryErr == nil {
+		body, served, getErr := adapter.Get(ctx, account, obj)
+		if getErr == nil {
+			_ = s.Store.HydrateObjectAttributes(ctx, &served)
+			return body, served, nil
+		}
+		primaryErr = getErr
 	}
-	return adapter.Get(ctx, account, obj)
+	body, served, fallbackErr := s.getObjectFromReplica(ctx, obj)
+	if fallbackErr == nil {
+		_ = s.Store.HydrateObjectAttributes(ctx, &served)
+		return body, served, nil
+	}
+	return nil, obj, fmt.Errorf("read primary and replicas: %w", errors.Join(primaryErr, fallbackErr))
 }
 
 func (s *Service) HeadObject(ctx context.Context, bucket, key string) (domain.ObjectRecord, error) {
-	obj, err := s.Store.GetObject(ctx, bucket, key)
+	obj, account, err := s.Store.GetObjectWithProvider(ctx, bucket, key)
 	if err != nil {
 		return obj, err
 	}
-	account, adapter, err := s.providerForObject(ctx, obj)
-	if err != nil {
-		return obj, err
+	account, adapter, primaryErr := s.providerForReplica(ctx, account)
+	if primaryErr == nil {
+		head, headErr := adapter.Head(ctx, account, obj)
+		if headErr == nil {
+			_ = s.Store.HydrateObjectAttributes(ctx, &head)
+			return head, nil
+		}
+		primaryErr = headErr
 	}
-	return adapter.Head(ctx, account, obj)
+	head, fallbackErr := s.headObjectFromReplica(ctx, obj)
+	if fallbackErr == nil {
+		_ = s.Store.HydrateObjectAttributes(ctx, &head)
+		return head, nil
+	}
+	return obj, fmt.Errorf("head primary and replicas: %w", errors.Join(primaryErr, fallbackErr))
+}
+
+func (s *Service) getObjectFromReplica(ctx context.Context, primary domain.ObjectRecord) (io.ReadCloser, domain.ObjectRecord, error) {
+	replicas, err := s.Store.ListObjectReplicas(ctx, primary.Bucket, primary.Key)
+	if err != nil {
+		return nil, primary, err
+	}
+	var failures []error
+	for _, replica := range replicas {
+		if replica.Status != replicaStatusSucceeded {
+			continue
+		}
+		account, err := s.Store.GetProvider(ctx, replica.ProviderAccountID)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("replica %s unavailable: %w", replica.ProviderAccountID, err))
+			continue
+		}
+		if !account.Enabled {
+			failures = append(failures, fmt.Errorf("replica %s is disabled", replica.ProviderAccountID))
+			continue
+		}
+		account, adapter, err := s.providerForReplica(ctx, account)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("replica %s: %w", replica.ProviderAccountID, err))
+			continue
+		}
+		candidate := objectRecordForReplica(primary, replica)
+		body, served, err := adapter.Get(ctx, account, candidate)
+		if err == nil {
+			return body, served, nil
+		}
+		failures = append(failures, fmt.Errorf("replica %s: %w", replica.ProviderAccountID, err))
+	}
+	if len(failures) == 0 {
+		return nil, primary, errors.New("no completed replicas are available")
+	}
+	return nil, primary, errors.Join(failures...)
+}
+
+func (s *Service) headObjectFromReplica(ctx context.Context, primary domain.ObjectRecord) (domain.ObjectRecord, error) {
+	replicas, err := s.Store.ListObjectReplicas(ctx, primary.Bucket, primary.Key)
+	if err != nil {
+		return primary, err
+	}
+	var failures []error
+	for _, replica := range replicas {
+		if replica.Status != replicaStatusSucceeded {
+			continue
+		}
+		account, err := s.Store.GetProvider(ctx, replica.ProviderAccountID)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("replica %s unavailable: %w", replica.ProviderAccountID, err))
+			continue
+		}
+		if !account.Enabled {
+			failures = append(failures, fmt.Errorf("replica %s is disabled", replica.ProviderAccountID))
+			continue
+		}
+		account, adapter, err := s.providerForReplica(ctx, account)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("replica %s: %w", replica.ProviderAccountID, err))
+			continue
+		}
+		candidate := objectRecordForReplica(primary, replica)
+		head, err := adapter.Head(ctx, account, candidate)
+		if err == nil {
+			return head, nil
+		}
+		failures = append(failures, fmt.Errorf("replica %s: %w", replica.ProviderAccountID, err))
+	}
+	if len(failures) == 0 {
+		return primary, errors.New("no completed replicas are available")
+	}
+	return primary, errors.Join(failures...)
+}
+
+func objectRecordForReplica(primary domain.ObjectRecord, replica domain.ObjectReplica) domain.ObjectRecord {
+	primary.ProviderAccountID = replica.ProviderAccountID
+	primary.RemoteBucket = replica.RemoteBucket
+	primary.RemoteKey = replica.RemoteKey
+	if replica.Size > 0 {
+		primary.Size = replica.Size
+	}
+	if replica.ETag != "" {
+		primary.ETag = replica.ETag
+	}
+	return primary
 }
 
 func (s *Service) DeleteObject(ctx context.Context, bucket, key string) error {
-	obj, err := s.Store.GetObject(ctx, bucket, key)
-	if err != nil {
-		return err
-	}
-	account, adapter, err := s.providerForObject(ctx, obj)
-	if err != nil {
-		return err
-	}
-	if err := adapter.Delete(ctx, account, obj); err != nil {
-		return err
-	}
-	s.deleteObjectReplicas(ctx, obj)
-	if err := s.Store.DeleteObject(ctx, bucket, key); err != nil {
-		return err
-	}
-	_ = s.Store.AddProviderUsage(ctx, obj.ProviderAccountID, -obj.Size)
-	s.dispatchObjectHook(ctx, domain.HookEventObjectDeleted, obj)
-	return nil
+	_, err := s.DeleteObjectWithOptions(ctx, bucket, key, DeleteObjectOptions{})
+	return err
 }
 
 func (s *Service) deleteObjectReplicas(ctx context.Context, obj domain.ObjectRecord) {
@@ -394,48 +577,6 @@ func (s *Service) spoolUpload(body io.Reader) (io.ReadSeeker, func(), error) {
 		return nil, nil, fmt.Errorf("rewind upload spool: %w", err)
 	}
 	return file, cleanup, nil
-}
-
-func (s *Service) replicateObject(ctx context.Context, input domain.PutObjectInput, primary domain.ObjectRecord, targets []string) string {
-	successes := 0
-	for _, providerID := range targets {
-		status := "failed"
-		errText := ""
-		account, err := s.Store.GetProvider(ctx, providerID)
-		if err != nil {
-			errText = err.Error()
-		} else if !account.Enabled {
-			errText = "provider is disabled"
-		} else if account.CapacityBytes > 0 && account.UsedBytes+input.Size > account.CapacityBytes {
-			errText = "provider has insufficient capacity"
-		} else {
-			var body io.ReadCloser
-			body, _, err = s.GetObject(ctx, primary.Bucket, primary.Key)
-			if err == nil {
-				var stored domain.StoredObject
-				stored, err = s.putOnProvider(ctx, account, input, body)
-				_ = body.Close()
-				if err == nil {
-					status = "succeeded"
-					successes++
-					_ = s.Store.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: primary.Bucket, Key: primary.Key, ProviderAccountID: account.ID, RemoteBucket: stored.RemoteBucket, RemoteKey: stored.RemoteKey, Size: stored.Size, ETag: stored.ETag, Status: status})
-					_ = s.Store.AddProviderUsage(ctx, account.ID, stored.Size)
-					continue
-				}
-			}
-			if err != nil {
-				errText = err.Error()
-			}
-		}
-		_ = s.Store.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: primary.Bucket, Key: primary.Key, ProviderAccountID: providerID, Status: status, Error: errText})
-	}
-	if successes == len(targets) {
-		return "completed"
-	}
-	if successes > 0 {
-		return "partial"
-	}
-	return "failed"
 }
 
 func replicaTargets(bucket domain.Bucket, primaryProviderID string) []string {

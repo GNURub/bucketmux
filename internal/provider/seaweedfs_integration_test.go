@@ -43,7 +43,7 @@ func TestSeaweedFSS3CompatibleProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	got, err := io.ReadAll(body)
 	if err != nil {
 		t.Fatalf("ReadAll() error = %v", err)

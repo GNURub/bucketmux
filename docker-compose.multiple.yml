@@ -1,10 +1,16 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: bucketmux
       POSTGRES_USER: bucketmux
-      POSTGRES_PASSWORD: ${BUCKETMUX_POSTGRES_PASSWORD:-bucketmux}
+      POSTGRES_PASSWORD: ${BUCKETMUX_POSTGRES_PASSWORD:?set BUCKETMUX_POSTGRES_PASSWORD}
     volumes:
       - bucketmux-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -12,41 +18,78 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    logging: *default-logging
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${BUCKETMUX_REDIS_PASSWORD:?set BUCKETMUX_REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${BUCKETMUX_REDIS_PASSWORD:?set BUCKETMUX_REDIS_PASSWORD}
     volumes:
       - bucketmux-redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging: *default-logging
     restart: unless-stopped
+
+  multipart-init:
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p /multipart && chown 10001:10001 /multipart && chmod 0750 /multipart"]
+    volumes:
+      - bucketmux-multipart:/multipart
+    logging: *default-logging
+    restart: "no"
 
   bucketmux-a:
     build: .
     image: bucketmux:local
     environment: &bucketmux-env
       CONFIG_PATH: /config/config.yaml
-      MASTER_KEY: ${BUCKETMUX_MASTER_KEY:-replace-with-a-long-random-secret}
-      S3_ACCESS_KEY: ${BUCKETMUX_S3_ACCESS_KEY:-local-access-key}
-      S3_SECRET_KEY: ${BUCKETMUX_S3_SECRET_KEY:-local-secret-key}
+      MASTER_KEY: ${BUCKETMUX_MASTER_KEY:?set BUCKETMUX_MASTER_KEY}
+      S3_ACCESS_KEY: ${BUCKETMUX_S3_ACCESS_KEY:?set BUCKETMUX_S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${BUCKETMUX_S3_SECRET_KEY:?set BUCKETMUX_S3_SECRET_KEY}
       ADMIN_ENABLED: "true"
-      ADMIN_USER: ${BUCKETMUX_ADMIN_USER:-admin}
-      ADMIN_PASSWORD: ${BUCKETMUX_ADMIN_PASSWORD:-change-me}
+      ADMIN_USER: ${BUCKETMUX_ADMIN_USER:?set BUCKETMUX_ADMIN_USER}
+      ADMIN_PASSWORD: ${BUCKETMUX_ADMIN_PASSWORD:?set BUCKETMUX_ADMIN_PASSWORD}
       STORE_KIND: postgres
-      POSTGRES_DSN: postgres://bucketmux:${BUCKETMUX_POSTGRES_PASSWORD:-bucketmux}@postgres:5432/bucketmux?sslmode=disable
+      POSTGRES_DSN: postgres://bucketmux:${BUCKETMUX_POSTGRES_PASSWORD:?set BUCKETMUX_POSTGRES_PASSWORD}@postgres:5432/bucketmux?sslmode=disable
       POSTGRES_MAX_OPEN_CONNS: 25
       POSTGRES_MAX_IDLE_CONNS: 10
       COORDINATION_KIND: redis
       REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${BUCKETMUX_REDIS_PASSWORD:?set BUCKETMUX_REDIS_PASSWORD}
       REDIS_KEY_PREFIX: bucketmux
+      MULTIPART_STAGING_DIR: /multipart
+      MAX_UPLOAD_BYTES: ${BUCKETMUX_MAX_UPLOAD_BYTES:-5368709120}
+      MAX_MULTIPART_PART_BYTES: ${BUCKETMUX_MAX_MULTIPART_PART_BYTES:-536870912}
+      MAX_ADMIN_BODY_BYTES: ${BUCKETMUX_MAX_ADMIN_BODY_BYTES:-1048576}
     volumes:
       - ./examples/config.multiple.yaml:/config/config.yaml:ro
       - bucketmux-a-data:/data
+      # Use NFS/a shared PVC at this path when replicas run on different hosts.
+      - bucketmux-multipart:/multipart
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
+      multipart-init:
+        condition: service_completed_successfully
     expose:
       - "8080"
     restart: unless-stopped
@@ -59,24 +102,44 @@ services:
     volumes:
       - ./examples/config.multiple.yaml:/config/config.yaml:ro
       - bucketmux-b-data:/data
+      - bucketmux-multipart:/multipart
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
+      multipart-init:
+        condition: service_completed_successfully
     expose:
       - "8080"
     restart: unless-stopped
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
     ports:
       - "8080:8080"
     volumes:
       - ./examples/nginx.bucketmux.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - bucketmux-a
-      - bucketmux-b
+      bucketmux-a:
+        condition: service_healthy
+      bucketmux-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/readyz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
     restart: unless-stopped
 
 volumes:
@@ -84,3 +147,4 @@ volumes:
   bucketmux-redis:
   bucketmux-a-data:
   bucketmux-b-data:
+  bucketmux-multipart:

@@ -1,7 +1,7 @@
-.git
-.data
-data
-*.db
-*.db-shm
-*.db-wal
-.env
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**

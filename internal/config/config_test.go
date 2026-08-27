@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func setRequiredEnv(t *testing.T) {
@@ -10,6 +12,38 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("MASTER_KEY", "test-master-key")
 	t.Setenv("S3_ACCESS_KEY", "ak")
 	t.Setenv("S3_SECRET_KEY", "sk")
+}
+
+func TestBucketProtectionConfiguration(t *testing.T) {
+	setRequiredEnv(t)
+	cfg := Default()
+	if err := yaml.Unmarshal([]byte(`
+buckets:
+  - name: images
+    versioning_enabled: true
+    trash_enabled: true
+    trash_retention_days: 30
+    object_lock_enabled: true
+    default_retention_mode: governance
+    default_retention_days: 7
+    lifecycle_rules:
+      - id: temporary
+        prefix: tmp/
+        expire_after_days: 2
+        purge_trash_after_days: 5
+        enabled: true
+`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	applyEnv(&cfg)
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	bucket := cfg.Buckets[0]
+	if bucket.VersioningEnabled == nil || !*bucket.VersioningEnabled || bucket.TrashRetentionDays == nil || *bucket.TrashRetentionDays != 30 || len(bucket.LifecycleRules) != 1 || bucket.LifecycleRules[0].PurgeTrashAfterDays != 5 {
+		t.Fatalf("bucket protection=%+v", bucket)
+	}
 }
 
 func TestLoadDefaultsToSQLiteStore(t *testing.T) {
@@ -24,6 +58,40 @@ func TestLoadDefaultsToSQLiteStore(t *testing.T) {
 	}
 	if cfg.Store.SQLite.Path != cfg.Server.DBPath {
 		t.Fatalf("Store.SQLite.Path = %q, Server.DBPath = %q", cfg.Store.SQLite.Path, cfg.Server.DBPath)
+	}
+	if cfg.Store.SQLite.MaxOpenConns != 10 || cfg.Store.SQLite.MaxIdleConns != 10 {
+		t.Fatalf("Store.SQLite pool = %+v, want 10 open and 10 idle connections", cfg.Store.SQLite)
+	}
+}
+
+func TestLoadSQLitePoolFromEnv(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SQLITE_MAX_OPEN_CONNS", "6")
+	t.Setenv("SQLITE_MAX_IDLE_CONNS", "4")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Store.SQLite.MaxOpenConns != 6 || cfg.Store.SQLite.MaxIdleConns != 4 {
+		t.Fatalf("Store.SQLite pool = %+v, want 6 open and 4 idle connections", cfg.Store.SQLite)
+	}
+}
+
+func TestLoadProductionLimitsAndMultipartStagingFromEnv(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("DATA_DIR", "/srv/bucketmux")
+	t.Setenv("MULTIPART_STAGING_DIR", "/shared/multipart")
+	t.Setenv("MAX_UPLOAD_BYTES", "1048576")
+	t.Setenv("MAX_MULTIPART_PART_BYTES", "524288")
+	t.Setenv("MAX_ADMIN_BODY_BYTES", "65536")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Server.MultipartStagingDir != "/shared/multipart" || cfg.Server.MaxUploadBytes != 1048576 || cfg.Server.MaxMultipartPartBytes != 524288 || cfg.Server.MaxAdminBodyBytes != 65536 {
+		t.Fatalf("server production limits = %+v", cfg.Server)
 	}
 }
 

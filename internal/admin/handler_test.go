@@ -33,10 +33,98 @@ func TestAdminIndexShowsProviderForm(t *testing.T) {
 		t.Fatalf("status = %d body=%s", res.Code, res.Body.String())
 	}
 	body := res.Body.String()
-	for _, want := range []string{"Action center", `data-open-dialog="provider-dialog"`, `<dialog id="provider-dialog"`, `<dialog id="bucket-dialog"`, `<dialog id="upload-dialog"`, `<dialog id="hook-dialog"`, `<dialog id="migration-dialog"`, `<dialog id="delete-object-dialog"`, "Eliminar permanentemente", "Migrar permanentemente", "Object browser", "Migration jobs", "Audit log", `id="object-browser-bucket"`, `id="migration-form"`, `id="migration-job-rows"`, `data-browse-objects`, "scrollIntoView", "/admin/api/objects/presign", "/admin/api/migrations", "Add / update provider", `name="secret_key"`, `value="s3-compatible"`, `settings_path`, `settings_cost_per_gb_month`, `settings_max_object_size_bytes`, `id="admin-upload-form"`, `name="replication_provider_ids"`, "Provider health", "Add / update HTTP hook", "Hook delivery history", "Secret headers"} {
+	for _, want := range []string{"Storage overview", "Action center", `id="admin-sidebar"`, `id="sidebar-toggle"`, `id="dashboard-search"`, `id="theme-toggle"`, `data-search-section`, `data-open-dialog="provider-dialog"`, `<dialog id="provider-dialog"`, `id="provider-catalog"`, `data-provider-preset="aws"`, `data-provider-preset="cloudflare"`, `data-provider-preset="custom"`, `id="provider-form"`, "cdn.jsdelivr.net/gh/glincker/thesvg@7870bc1c5f657d9accbb7f96cc457b8dd3363ee8", `<dialog id="bucket-dialog"`, `<dialog id="upload-dialog"`, `<dialog id="hook-dialog"`, `<dialog id="migration-dialog"`, `<dialog id="delete-object-dialog"`, "Delete permanently", "Migrate permanently", "Object browser", "Migration jobs", "Audit log", `id="object-browser-bucket"`, `id="migration-form"`, `id="migration-job-rows"`, `data-browse-objects`, "scrollIntoView", "/admin/api/objects/presign", "/admin/api/migrations", "Add / update provider", `name="secret_key"`, `value="s3-compatible"`, `settings_path`, `settings_cost_per_gb_month`, `settings_max_object_size_bytes`, `id="admin-upload-form"`, `name="replication_provider_ids"`, "Provider health", "Add / update HTTP hook", "Hook delivery history", "Secret headers"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("admin body missing %q", want)
 		}
+	}
+	for _, want := range []string{"Remote inventory", "Integrity and auto-repair", "Access credentials", "Recoverable trash", "Cost optimizer", `<dialog id="inventory-dialog"`, `<dialog id="repair-dialog"`, `<dialog id="credential-dialog"`, `<dialog id="placement-dialog"`, "Test connection", "Discover buckets", "Object Lock", "Run lifecycle", "/admin/api/inventory-jobs", "/admin/api/repair-jobs", "/admin/api/access-credentials", "/admin/api/placement-plan"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("advanced admin body missing %q", want)
+		}
+	}
+}
+
+func TestProviderBrandDetectionAndIconURLs(t *testing.T) {
+	tests := []struct {
+		name    string
+		account domain.ProviderAccount
+		brand   string
+		hasIcon bool
+	}{
+		{name: "local", account: domain.ProviderAccount{Kind: domain.ProviderKindLocal}, brand: "local"},
+		{name: "aws", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.us-east-1.amazonaws.com"}, brand: "aws", hasIcon: true},
+		{name: "cloudflare", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://account.r2.cloudflarestorage.com"}, brand: "cloudflare", hasIcon: true},
+		{name: "google cloud", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://storage.googleapis.com"}, brand: "gcs", hasIcon: true},
+		{name: "backblaze", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.us-west-004.backblazeb2.com"}, brand: "backblaze", hasIcon: true},
+		{name: "digitalocean", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://nyc3.digitaloceanspaces.com"}, brand: "digitalocean", hasIcon: true},
+		{name: "wasabi", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.us-east-1.wasabisys.com"}, brand: "wasabi", hasIcon: true},
+		{name: "minio", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://minio.example.com"}, brand: "minio", hasIcon: true},
+		{name: "cloudinary", account: domain.ProviderAccount{Kind: domain.ProviderKindCloudinary}, brand: "cloudinary", hasIcon: true},
+		{name: "vercel", account: domain.ProviderAccount{Kind: domain.ProviderKindVercelBlob}, brand: "vercel", hasIcon: true},
+		{name: "custom", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://objects.example.com"}, brand: "custom"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			brand := providerBrand(tt.account)
+			if brand != tt.brand {
+				t.Fatalf("providerBrand() = %q, want %q", brand, tt.brand)
+			}
+			if got := providerIconURL(brand); (got != "") != tt.hasIcon {
+				t.Fatalf("providerIconURL(%q) = %q, hasIcon want %v", brand, got, tt.hasIcon)
+			}
+		})
+	}
+}
+
+func TestAdminRejectsCrossSiteMutation(t *testing.T) {
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/buckets", strings.NewReader("name=blocked"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://attacker.example")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("cross-site mutation status = %d, want 403; body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestAdminAcceptsConfiguredPublicOrigin(t *testing.T) {
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+	handler.svc.Config.Server.PublicBaseURL = "https://storage.example.com"
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/buckets", strings.NewReader("name=safe-origin"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://storage.example.com")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	if res.Code == http.StatusForbidden {
+		t.Fatalf("configured same-origin mutation was rejected: %s", res.Body.String())
+	}
+}
+
+func TestAdminRejectsOversizedMutation(t *testing.T) {
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+	handler.svc.Config.Server.MaxAdminBodyBytes = 8
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/providers", strings.NewReader(`{"payload":"too large"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized mutation status = %d, want 413; body=%s", res.Code, res.Body.String())
 	}
 }
 
@@ -62,6 +150,62 @@ func TestAdminCreateProviderFromForm(t *testing.T) {
 
 	if res.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestAdminCredentialLifecycleAndOpenAPI(t *testing.T) {
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+	createBody := `{"name":"Assets reader","role":"read-only","bucket_patterns":["images"],"prefix_patterns":["public/*"],"enabled":true}`
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/access-credentials", strings.NewReader(createBody))
+	request.Header.Set("Content-Type", "application/json")
+	request.SetBasicAuth("admin", "change-me")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create credential status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created app.CreatedAccessCredential
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil || created.SecretKey == "" || created.Credential.AccessKey == "" {
+		t.Fatalf("created credential=%+v err=%v", created, err)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/admin/api/access-credentials", nil)
+	request.SetBasicAuth("admin", "change-me")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), created.SecretKey) || !strings.Contains(response.Body.String(), created.Credential.AccessKey) {
+		t.Fatalf("list credentials status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/admin/openapi.json", nil)
+	request.SetBasicAuth("admin", "change-me")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"openapi":"3.1.0"`) || !strings.Contains(response.Body.String(), "/admin/api/inventory-jobs") || !strings.Contains(response.Body.String(), "/admin/api/repair-jobs") {
+		t.Fatalf("OpenAPI status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAdminCreatesDurableRepairJob(t *testing.T) {
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/repair-jobs", strings.NewReader(`{"bucket":"images","prefix":"photos/"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.SetBasicAuth("admin", "change-me")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"bucket":"images"`) {
+		t.Fatalf("create repair status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/admin/api/repair-jobs", nil)
+	request.SetBasicAuth("admin", "change-me")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"prefix":"photos/"`) {
+		t.Fatalf("list repair status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -357,7 +501,7 @@ func TestAdminDeleteObjectRequiresExactConfirmation(t *testing.T) {
 		t.Fatalf("object should still exist after wrong confirmation: %v", err)
 	}
 
-	rightBody := strings.NewReader(`{"bucket":"images","key":"delete/me.txt","confirm":"Eliminar permanentemente"}`)
+	rightBody := strings.NewReader(`{"bucket":"images","key":"delete/me.txt","confirm":"Delete permanently"}`)
 	req = httptest.NewRequest(http.MethodDelete, "/admin/api/objects", rightBody)
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth("admin", "change-me")
@@ -509,7 +653,7 @@ func newTestAdminHandlerWithProvider(t *testing.T) (*Handler, func()) {
 			Bucket:        "images",
 			CapacityBytes: 1024 * 1024,
 			Priority:      1,
-			Enabled:       boolPtr(true),
+			Enabled:       new(true),
 			Settings:      map[string]string{"path": filepath.Join(dataDir, "objects")},
 		}},
 	})
@@ -518,5 +662,3 @@ func newTestAdminHandlerWithProvider(t *testing.T) (*Handler, func()) {
 	}
 	return NewHandler(svc), func() { _ = svc.Close() }
 }
-
-func boolPtr(v bool) *bool { return &v }

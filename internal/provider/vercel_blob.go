@@ -30,7 +30,7 @@ func NewVercelBlobAdapter() *VercelBlobAdapter {
 }
 
 func (a *VercelBlobAdapter) Put(ctx context.Context, account domain.ProviderAccount, input domain.PutObjectInput, body io.Reader) (domain.StoredObject, error) {
-	remoteKey, err := vercelBlobPath(input.Key)
+	remoteKey, err := vercelBlobPath(input.StorageKey())
 	if err != nil {
 		return domain.StoredObject{}, err
 	}
@@ -61,7 +61,7 @@ func (a *VercelBlobAdapter) Put(ctx context.Context, account domain.ProviderAcco
 	if err != nil {
 		return domain.StoredObject{}, fmt.Errorf("put vercel blob object: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 		return domain.StoredObject{}, fmt.Errorf("put vercel blob object failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
@@ -106,7 +106,7 @@ func (a *VercelBlobAdapter) Get(ctx context.Context, account domain.ProviderAcco
 		return nil, obj, fmt.Errorf("get vercel blob object: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		return nil, obj, fmt.Errorf("get vercel blob object failed: status=%d", res.StatusCode)
 	}
 	obj.ContentType = firstNonEmpty(res.Header.Get("Content-Type"), obj.ContentType)
@@ -132,7 +132,7 @@ func (a *VercelBlobAdapter) Head(ctx context.Context, account domain.ProviderAcc
 	if err != nil {
 		return obj, fmt.Errorf("head vercel blob object: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		return obj, fmt.Errorf("head vercel blob object failed: status=%d", res.StatusCode)
 	}
@@ -164,7 +164,7 @@ func (a *VercelBlobAdapter) Delete(ctx context.Context, account domain.ProviderA
 	if err != nil {
 		return fmt.Errorf("delete vercel blob object: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 		return fmt.Errorf("delete vercel blob object failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
@@ -191,7 +191,7 @@ func (a *VercelBlobAdapter) Health(ctx context.Context, account domain.ProviderA
 	if err != nil {
 		return unhealthy(account, started, "Vercel Blob list probe failed: %v", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	switch {
 	case res.StatusCode >= 200 && res.StatusCode < 300:
 		return healthy(account, started, "Vercel Blob API responded")
@@ -263,10 +263,10 @@ func vercelBlobPath(value string) (string, error) {
 	if value == "" || len(value) > maxVercelBlobPathLength || strings.Contains(value, "//") {
 		return "", fmt.Errorf("invalid Vercel Blob pathname %q", value)
 	}
-	parts := strings.Split(value, "/")
-	for _, part := range parts {
+	parts := strings.SplitSeq(value, "/")
+	for part := range parts {
 		if part == "" || part == "." || part == ".." {
-			return "", fmt.Errorf("Vercel Blob pathname %q contains unsafe segment", value)
+			return "", fmt.Errorf("vercel blob pathname %q contains unsafe segment", value)
 		}
 	}
 	return value, nil

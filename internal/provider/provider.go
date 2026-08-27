@@ -15,6 +15,17 @@ type Adapter interface {
 	Health(ctx context.Context, account domain.ProviderAccount) domain.ProviderHealth
 }
 
+// ObjectLister and BucketDiscoverer are optional capabilities. Adapters that
+// cannot enumerate their backing service remain valid storage targets while
+// the inventory API returns an explicit unsupported-capability error.
+type ObjectLister interface {
+	ListObjects(ctx context.Context, account domain.ProviderAccount, bucket, prefix, continuationToken string, limit int) (domain.ProviderObjectPage, error)
+}
+
+type BucketDiscoverer interface {
+	DiscoverBuckets(ctx context.Context, account domain.ProviderAccount) ([]domain.ProviderBucket, error)
+}
+
 type Registry struct {
 	adapters map[domain.ProviderKind]Adapter
 }

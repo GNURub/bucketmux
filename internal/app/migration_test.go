@@ -64,7 +64,7 @@ func TestRunMigrationJobMovesBucketPrefixBetweenProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetObject(content) error = %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	data, err := io.ReadAll(body)
 	if err != nil {
 		t.Fatalf("ReadAll() error = %v", err)
@@ -154,7 +154,7 @@ func newMigrationTestService(t *testing.T) (*Service, func()) {
 				Bucket:        "images",
 				CapacityBytes: 1024 * 1024,
 				Priority:      1,
-				Enabled:       boolPtr(true),
+				Enabled:       new(true),
 				Settings:      map[string]string{"path": filepath.Join(dataDir, "source")},
 			},
 			{
@@ -164,7 +164,7 @@ func newMigrationTestService(t *testing.T) (*Service, func()) {
 				Bucket:        "images",
 				CapacityBytes: 1024 * 1024,
 				Priority:      100,
-				Enabled:       boolPtr(true),
+				Enabled:       new(true),
 				Settings:      map[string]string{"path": filepath.Join(dataDir, "target")},
 			},
 		},

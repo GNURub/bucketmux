@@ -1,0 +1,33 @@
+server:
+  addr: ":8080"
+  data_dir: "/data"
+
+buckets:
+  - name: "images"
+    replication_enabled: true
+    replication_provider_ids:
+      - "shared-ministack-replica"
+
+providers:
+  - id: "shared-ministack"
+    name: "Shared MiniStack provider"
+    kind: "s3-compatible"
+    endpoint: "http://ministack:4566"
+    region: "us-east-1"
+    bucket: "bucketmux-multi-instance"
+    access_key: "test"
+    secret_key: "test"
+    capacity_bytes: 1073741824
+    priority: 1
+    enabled: true
+  - id: "shared-ministack-replica"
+    name: "Shared MiniStack replica provider"
+    kind: "s3-compatible"
+    endpoint: "http://ministack-replica:4566"
+    region: "us-east-1"
+    bucket: "bucketmux-multi-instance-replica"
+    access_key: "test"
+    secret_key: "test"
+    capacity_bytes: 1073741824
+    priority: 100
+    enabled: true

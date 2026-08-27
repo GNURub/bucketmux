@@ -33,6 +33,8 @@ func (h *UppyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/uppy/s3")
 	switch path {
+	case "/sign":
+		h.signS3Request(w, r)
 	case "/params":
 		h.getUploadParameters(w, r)
 	case "/multipart/create":
@@ -48,6 +50,85 @@ func (h *UppyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown Uppy S3 helper endpoint")
 	}
+}
+
+// signS3Request implements the @uppy/aws-s3 v6 signRequest contract. Uppy v6
+// performs the S3 operations itself and asks the application for one presigned
+// URL per request, including multipart creation, listing, completion and abort.
+// The same endpoint also signs direct object reads and deletes for browser clients
+// that use fetch without Uppy.
+func (h *UppyHandler) signS3Request(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req uppySignRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	bucket := defaultString(req.Bucket, "images")
+	key := strings.Trim(strings.TrimSpace(req.Key), "/")
+	if key == "" {
+		writeJSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	query := url.Values{}
+	switch method {
+	case http.MethodPut:
+		if req.UploadID == "" && req.PartNumber != 0 {
+			writeJSONError(w, http.StatusBadRequest, "uploadId is required when partNumber is set")
+			return
+		}
+		if req.UploadID != "" {
+			if req.PartNumber <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "partNumber is required for multipart PUT")
+				return
+			}
+			query.Set("uploadId", req.UploadID)
+			query.Set("partNumber", strconv.Itoa(req.PartNumber))
+		}
+	case http.MethodPost:
+		if req.PartNumber != 0 {
+			writeJSONError(w, http.StatusBadRequest, "partNumber is not valid for POST")
+			return
+		}
+		if req.UploadID == "" {
+			query.Set("uploads", "")
+		} else {
+			query.Set("uploadId", req.UploadID)
+		}
+	case http.MethodGet:
+		if req.PartNumber != 0 {
+			writeJSONError(w, http.StatusBadRequest, "partNumber is not valid for GET")
+			return
+		}
+		if req.UploadID != "" {
+			query.Set("uploadId", req.UploadID)
+		}
+	case http.MethodDelete:
+		if req.PartNumber != 0 {
+			writeJSONError(w, http.StatusBadRequest, "partNumber is not valid for DELETE")
+			return
+		}
+		if req.UploadID != "" {
+			query.Set("uploadId", req.UploadID)
+		}
+	default:
+		writeJSONError(w, http.StatusBadRequest, "method must be PUT, POST, GET or DELETE")
+		return
+	}
+
+	if len(query) == 0 {
+		query = nil
+	}
+	presignedURL, ok := h.presignForRequest(r, method, bucket, key, query, expiresDuration(req.ExpiresIn))
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "could not presign S3 request")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"url": presignedURL})
 }
 
 func (h *UppyHandler) getUploadParameters(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +341,15 @@ type uppyUploadParamsRequest struct {
 	Filename    string `json:"filename"`
 	ContentType string `json:"contentType"`
 	ExpiresIn   int    `json:"expiresIn"`
+}
+
+type uppySignRequest struct {
+	Method     string `json:"method"`
+	Bucket     string `json:"bucket"`
+	Key        string `json:"key"`
+	UploadID   string `json:"uploadId"`
+	PartNumber int    `json:"partNumber"`
+	ExpiresIn  int    `json:"expiresIn"`
 }
 
 type uppyMultipartRequest struct {

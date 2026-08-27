@@ -1,6 +1,11 @@
 server:
   addr: ":8080"
   data_dir: "/data"
+  # Mount this path on shared storage in multi-instance deployments.
+  multipart_staging_dir: "/data/multipart"
+  max_upload_bytes: 5368709120 # 5 GiB total object size
+  max_multipart_part_bytes: 536870912 # 512 MiB per part
+  max_admin_body_bytes: 1048576 # 1 MiB for non-upload admin mutations
   # Deprecated but still supported for SQLite. Prefer store.sqlite.path.
   db_path: "/data/switcher.db"
   # Optional. Use when BucketMux runs behind a reverse proxy/path and admin-generated
@@ -13,6 +18,8 @@ store:
   kind: "sqlite" # sqlite | postgres
   sqlite:
     path: "/data/switcher.db"
+    max_open_conns: 10
+    max_idle_conns: 10
   postgres:
     dsn: "postgres://bucketmux:bucketmux@postgres:5432/bucketmux?sslmode=disable"
     max_open_conns: 25
@@ -38,6 +45,16 @@ admin:
   enabled: true
   username: "admin"
   password: "change-me"
+  # Optional OpenID Connect login. Basic Auth remains available when username/password are set.
+  oidc:
+    enabled: false
+    issuer_url: "https://id.example.com"
+    client_id: "bucketmux"
+    client_secret: "" # Prefer ADMIN_OIDC_CLIENT_SECRET in production.
+    redirect_url: "https://files.example.com/admin/oidc/callback"
+    scopes: ["openid", "profile", "email"]
+    allowed_groups: ["storage-admins"]
+    session_hours: 8
 
 buckets:
   - name: "images"
@@ -45,6 +62,19 @@ buckets:
     # Optional: provider IDs where objects in this bucket should be replicated.
     # Empty or omitted means no replication.
     replication_provider_ids: []
+    # Omitted protection fields preserve settings changed through the admin UI.
+    versioning_enabled: true
+    trash_enabled: true
+    trash_retention_days: 30
+    object_lock_enabled: false
+    default_retention_mode: "GOVERNANCE" # GOVERNANCE | COMPLIANCE
+    default_retention_days: 0
+    lifecycle_rules:
+      - id: "expire-temporary"
+        prefix: "tmp/"
+        expire_after_days: 7
+        purge_trash_after_days: 30
+        enabled: true
 
 providers:
   # Optional local hard-drive provider. Remove this block if you only want remote providers.

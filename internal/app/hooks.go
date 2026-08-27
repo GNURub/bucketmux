@@ -20,6 +20,9 @@ import (
 
 const defaultHookTimeout = 5 * time.Second
 const defaultHookMaxAttempts = 3
+const hookWorkerInterval = time.Second
+const hookHeartbeatInterval = 10 * time.Second
+const hookWorkStaleAfter = 30 * time.Second
 
 type HookPayload struct {
 	Event             string    `json:"event"`
@@ -128,12 +131,27 @@ func (s *Service) dispatchObjectHook(ctx context.Context, event string, obj doma
 		ReplicaStatus:     obj.ReplicaStatus,
 		Timestamp:         time.Now().UTC(),
 	}
-	payloadJSON, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
+	notifications, _ := s.Store.ListBucketNotifications(ctx, obj.Bucket)
 	for _, hook := range hooks {
 		if hook.Kind != domain.HookKindHTTP || !hookMatchesEvent(hook, event) {
+			continue
+		}
+		matching := matchingBucketNotifications(notifications, hook.ID, event, obj.Key)
+		configuredForBucket := false
+		for _, notification := range notifications {
+			if notification.HookID == hook.ID {
+				configuredForBucket = true
+				break
+			}
+		}
+		if configuredForBucket && len(matching) == 0 {
+			continue
+		}
+		payloadJSON, err := json.Marshal(payload)
+		if len(matching) > 0 {
+			payloadJSON, err = json.Marshal(s3NotificationPayload(matching[0], event, obj))
+		}
+		if err != nil {
 			continue
 		}
 		deliveryID, err := randomHookDeliveryID()
@@ -154,50 +172,77 @@ func (s *Service) dispatchObjectHook(ctx context.Context, event string, obj doma
 		if err := s.Store.CreateHookDelivery(ctx, delivery); err != nil {
 			continue
 		}
-		go s.deliverHookDelivery(delivery.ID)
+		signalWorker(s.hookWorkerWake)
 	}
+}
+
+func matchingBucketNotifications(notifications []domain.BucketNotification, hookID, event, key string) []domain.BucketNotification {
+	var result []domain.BucketNotification
+	for _, notification := range notifications {
+		if notification.HookID != hookID || notification.Event != event || !strings.HasPrefix(key, notification.Prefix) || !strings.HasSuffix(key, notification.Suffix) {
+			continue
+		}
+		result = append(result, notification)
+	}
+	return result
+}
+
+func s3NotificationPayload(notification domain.BucketNotification, event string, object domain.ObjectRecord) map[string]any {
+	eventName := "ObjectCreated:Put"
+	if event == domain.HookEventObjectDeleted {
+		eventName = "ObjectRemoved:Delete"
+	}
+	return map[string]any{"Records": []any{map[string]any{
+		"eventVersion": "2.1",
+		"eventSource":  "aws:s3",
+		"awsRegion":    "auto",
+		"eventTime":    time.Now().UTC().Format(time.RFC3339Nano),
+		"eventName":    eventName,
+		"userIdentity": map[string]any{"principalId": "bucketmux"},
+		"s3": map[string]any{
+			"s3SchemaVersion": "1.0",
+			"configurationId": notification.ID,
+			"bucket":          map[string]any{"name": object.Bucket, "arn": "arn:aws:s3:::" + object.Bucket},
+			"object":          map[string]any{"key": url.QueryEscape(object.Key), "size": object.Size, "eTag": strings.Trim(object.ETag, `"`), "sequencer": strings.ToUpper(randomIdentifier("", 8))},
+		},
+	}}}
 }
 
 func hookMatchesEvent(hook domain.Hook, event string) bool {
 	return len(hook.Events) == 0 || slices.Contains(hook.Events, event)
 }
 
-func (s *Service) deliverHookDelivery(deliveryID string) {
-	delivery, err := s.Store.GetHookDelivery(context.Background(), deliveryID)
-	if err != nil || delivery.Status != domain.HookDeliveryStatusPending {
-		return
+func (s *Service) deliverHookDelivery(ctx context.Context, delivery domain.HookDelivery) error {
+	if delivery.Status != domain.HookDeliveryStatusRunning {
+		return fmt.Errorf("hook delivery %s is not claimed", delivery.ID)
 	}
-	hook, err := s.Store.GetHook(context.Background(), delivery.HookID)
+	hook, err := s.Store.GetHook(ctx, delivery.HookID)
 	if err != nil || !hook.Enabled || hook.Kind != domain.HookKindHTTP {
 		delivery.Status = domain.HookDeliveryStatusFailed
 		delivery.LastError = "hook not found, disabled or not http"
-		_ = s.Store.UpdateHookDelivery(context.Background(), delivery)
-		return
+		return s.Store.UpdateHookDelivery(ctx, delivery)
 	}
-	statusCode, errText := s.deliverHTTPHook(hook, []byte(delivery.PayloadJSON))
+	statusCode, errText := s.deliverHTTPHook(ctx, delivery.ID, hook, []byte(delivery.PayloadJSON))
 	delivery.Attempts++
 	delivery.LastStatusCode = statusCode
 	delivery.LastError = errText
 	if errText == "" && statusCode >= 200 && statusCode < 300 {
 		delivery.Status = domain.HookDeliveryStatusSucceeded
 		delivery.NextAttemptAt = time.Now().UTC()
-		_ = s.Store.UpdateHookDelivery(context.Background(), delivery)
-		return
+		return s.Store.UpdateHookDelivery(ctx, delivery)
 	}
 	if delivery.Attempts >= delivery.MaxAttempts {
 		delivery.Status = domain.HookDeliveryStatusFailed
 		delivery.NextAttemptAt = time.Now().UTC()
-		_ = s.Store.UpdateHookDelivery(context.Background(), delivery)
-		return
+		return s.Store.UpdateHookDelivery(ctx, delivery)
 	}
 	delivery.Status = domain.HookDeliveryStatusPending
 	delay := s.hookRetryDelay(delivery.Attempts)
 	delivery.NextAttemptAt = time.Now().UTC().Add(delay)
-	_ = s.Store.UpdateHookDelivery(context.Background(), delivery)
-	time.AfterFunc(delay, func() { s.deliverHookDelivery(delivery.ID) })
+	return s.Store.UpdateHookDelivery(ctx, delivery)
 }
 
-func (s *Service) deliverHTTPHook(hook domain.Hook, body []byte) (int, string) {
+func (s *Service) deliverHTTPHook(parent context.Context, deliveryID string, hook domain.Hook, body []byte) (int, string) {
 	client := s.HookHTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: defaultHookTimeout}
@@ -216,13 +261,14 @@ func (s *Service) deliverHTTPHook(hook domain.Hook, body []byte) (int, string) {
 	} else {
 		reader = bytes.NewReader(body)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), defaultHookTimeout)
+	ctx, cancel := context.WithTimeout(parent, defaultHookTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, hook.URL, reader)
 	if err != nil {
 		return 0, err.Error()
 	}
 	req.Header.Set("User-Agent", "BucketMux-Hook/1")
+	req.Header.Set("X-BucketMux-Delivery-ID", deliveryID)
 	if method != http.MethodGet {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -292,36 +338,48 @@ func (s *Service) ListHooksForAdmin(ctx context.Context) ([]domain.Hook, error) 
 }
 
 func (s *Service) StartHookDeliveryWorker(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	s.processPendingHookDeliveriesWithLease(ctx, 50)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			s.processPendingHookDeliveriesWithLease(ctx, 50)
-		}
-	}
-}
-
-func (s *Service) processPendingHookDeliveriesWithLease(ctx context.Context, limit int) {
-	lease, ok := s.tryWorkerLease(ctx, "hooks")
-	if !ok {
-		return
-	}
-	defer lease.Release(ctx)
-	_ = s.ProcessPendingHookDeliveries(ctx, limit)
+	s.runDurableWorker(ctx, durableWorker{
+		name:              "hooks",
+		interval:          hookWorkerInterval,
+		heartbeatInterval: hookHeartbeatInterval,
+		staleAfter:        hookWorkStaleAfter,
+		wake:              s.hookWorkerWake,
+		recover: func(ctx context.Context, cutoff time.Time) error {
+			_, err := s.Store.RecoverStaleHookDeliveries(ctx, cutoff)
+			return err
+		},
+		claim: func(ctx context.Context) (durableWorkItem, bool, error) {
+			delivery, claimed, err := s.Store.ClaimNextHookDelivery(ctx, time.Now().UTC())
+			if err != nil || !claimed {
+				return durableWorkItem{}, claimed, err
+			}
+			return durableWorkItem{
+				run: func(ctx context.Context) error {
+					return s.deliverHookDelivery(ctx, delivery)
+				},
+				heartbeat: func(ctx context.Context) error {
+					return s.Store.TouchHookDelivery(ctx, delivery.ID)
+				},
+			}, true, nil
+		},
+	})
 }
 
 func (s *Service) ProcessPendingHookDeliveries(ctx context.Context, limit int) error {
-	deliveries, err := s.Store.ListPendingHookDeliveries(ctx, time.Now().UTC(), limit)
-	if err != nil {
-		return err
+	if limit <= 0 || limit > 200 {
+		limit = 50
 	}
-	for _, delivery := range deliveries {
-		delivery := delivery
-		go s.deliverHookDelivery(delivery.ID)
+	for range limit {
+		delivery, claimed, err := s.Store.ClaimNextHookDelivery(ctx, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return nil
+		}
+		if err := s.deliverHookDelivery(ctx, delivery); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -363,9 +421,10 @@ func isValidHookHeaderName(name string) bool {
 		return false
 	}
 	for _, ch := range name {
-		if !(ch == '!' || ch == '#' || ch == '$' || ch == '%' || ch == '&' || ch == '\'' || ch == '*' || ch == '+' || ch == '-' || ch == '.' || ch == '^' || ch == '_' || ch == '`' || ch == '|' || ch == '~' || ch >= '0' && ch <= '9' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z') {
-			return false
+		if ch >= '0' && ch <= '9' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || strings.ContainsRune("!#$%&'*+-.^_`|~", ch) {
+			continue
 		}
+		return false
 	}
 	return true
 }

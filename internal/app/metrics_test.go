@@ -21,10 +21,15 @@ func TestPrometheusMetricsExposeProviderUsage(t *testing.T) {
 		"bucketmux_bucket_provider_objects",
 		"bucketmux_migration_jobs",
 		"bucketmux_hook_deliveries",
+		"bucketmux_worker_failures_total",
+		`worker="hooks"`,
 	} {
 		if !strings.Contains(metrics, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, metrics)
 		}
+	}
+	if got := strings.Count(metrics, `bucketmux_worker_failures_total{worker="hooks"}`); got != 1 {
+		t.Fatalf("hook worker failure metric series count = %d, want 1", got)
 	}
 
 	_, err := svc.CreateMigrationJob(context.Background(), CreateMigrationJobInput{Bucket: "images", SourceProviderID: "local-source", TargetProviderID: "local-target", Mode: domain.MigrationModeCopy})

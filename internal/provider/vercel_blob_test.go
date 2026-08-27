@@ -101,7 +101,7 @@ func TestVercelBlobAdapterRoundTripAgainstAPIShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	data, _ := io.ReadAll(body)
 	if string(data) != "cat" || got.Size != 3 || got.ContentType != "text/plain" {
 		t.Fatalf("get data=%q obj=%+v", data, got)

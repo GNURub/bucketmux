@@ -17,6 +17,20 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		if err := healthcheck(context.Background(), configuredHealthcheckURL()); err != nil {
+			logger.Error("healthcheck failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "admin" {
+		if err := runAdminCLI(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			logger.Error("admin command failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	configPath := os.Getenv("CONFIG_PATH")
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -29,12 +43,18 @@ func main() {
 		logger.Error("create service", "error", err)
 		os.Exit(1)
 	}
-	defer svc.Close()
+	defer func() {
+		if err := svc.Close(); err != nil {
+			logger.Error("close service", "error", err)
+		}
+	}()
 
 	server := &http.Server{
 		Addr:              cfg.Server.Addr,
 		Handler:           httpserver.NewHTTPHandler(svc),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {

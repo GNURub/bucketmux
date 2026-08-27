@@ -5,3 +5,9 @@
 .env
 /dist/
 /tmp/
+/test/e2e/uppy/dist/
+/test/e2e/uppy/node_modules/
+prompts.txt
+/.codegraph/
+/.playwright-cli/
+/output/

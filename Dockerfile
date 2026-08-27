@@ -1,22 +1,42 @@
-FROM golang:1.26-alpine AS build
-WORKDIR /src
-RUN apk add --no-cache ca-certificates
-COPY go.mod go.sum* ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/bucketmux ./cmd/bucketmux
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates && adduser -D -h /app switcher
+FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine3.24@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY cmd ./cmd
+COPY internal ./internal
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/bucketmux ./cmd/bucketmux \
+    && mkdir /out/data \
+    && chown 10001:10001 /out/data
+
+FROM scratch
+
 WORKDIR /app
-COPY --from=build /out/bucketmux /usr/local/bin/bucketmux
-COPY config.example.yaml /config/config.yaml
-RUN mkdir -p /data && chown -R switcher:switcher /data /config
-USER switcher
-ENV CONFIG_PATH=/config/config.yaml \
-    DB_PATH=/data/switcher.db \
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build --chown=10001:10001 /out/data /data
+COPY --from=build --chown=0:0 --chmod=0555 /out/bucketmux /usr/local/bin/bucketmux
+
+USER 10001:10001
+ENV DB_PATH=/data/switcher.db \
     DATA_DIR=/data \
     ADMIN_ENABLED=false
-VOLUME ["/data", "/config"]
+
+VOLUME ["/data"]
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/bucketmux", "healthcheck"]
+
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["bucketmux"]

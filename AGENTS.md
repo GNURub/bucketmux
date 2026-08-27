@@ -6,7 +6,7 @@
 
 ## OVERVIEW
 
-BucketMux is a single-binary Go 1.26 service exposing a practical S3-compatible gateway over multiple storage providers. It owns provider routing, encrypted credentials, object index state, admin operations, hooks, migrations, replication, and optional multi-instance worker coordination.
+BucketMux is a single-binary Go 1.27 service exposing a practical S3-compatible gateway over multiple storage providers. It owns provider routing, encrypted credentials, object index state, admin operations, hooks, migrations, replication, and optional multi-instance worker coordination.
 
 ## STRUCTURE
 

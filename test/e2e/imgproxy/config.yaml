@@ -1,0 +1,24 @@
+server:
+  addr: ":8080"
+  data_dir: "/data"
+
+store:
+  kind: "sqlite"
+  sqlite:
+    path: "/data/switcher.db"
+    max_open_conns: 10
+    max_idle_conns: 10
+
+buckets:
+  - name: "images"
+
+providers:
+  - id: "imgproxy-local"
+    name: "imgproxy certification storage"
+    kind: "local"
+    bucket: "images"
+    capacity_bytes: 1073741824
+    priority: 100
+    enabled: true
+    settings:
+      path: "/data/objects"

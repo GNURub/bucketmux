@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   bucketmux:
     build: .
@@ -7,17 +13,29 @@ services:
       - "8080:8080"
     environment:
       CONFIG_PATH: /config/config.yaml
-      MASTER_KEY: ${BUCKETMUX_MASTER_KEY:-replace-with-a-long-random-secret}
-      S3_ACCESS_KEY: ${BUCKETMUX_S3_ACCESS_KEY:-local-access-key}
-      S3_SECRET_KEY: ${BUCKETMUX_S3_SECRET_KEY:-local-secret-key}
+      MASTER_KEY: ${BUCKETMUX_MASTER_KEY:?set BUCKETMUX_MASTER_KEY}
+      S3_ACCESS_KEY: ${BUCKETMUX_S3_ACCESS_KEY:?set BUCKETMUX_S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${BUCKETMUX_S3_SECRET_KEY:?set BUCKETMUX_S3_SECRET_KEY}
       ADMIN_ENABLED: "true"
-      ADMIN_USER: ${BUCKETMUX_ADMIN_USER:-admin}
-      ADMIN_PASSWORD: ${BUCKETMUX_ADMIN_PASSWORD:-change-me}
+      ADMIN_USER: ${BUCKETMUX_ADMIN_USER:?set BUCKETMUX_ADMIN_USER}
+      ADMIN_PASSWORD: ${BUCKETMUX_ADMIN_PASSWORD:?set BUCKETMUX_ADMIN_PASSWORD}
       STORE_KIND: sqlite
       SQLITE_PATH: /data/switcher.db
+      MAX_UPLOAD_BYTES: ${BUCKETMUX_MAX_UPLOAD_BYTES:-5368709120}
+      MAX_MULTIPART_PART_BYTES: ${BUCKETMUX_MAX_MULTIPART_PART_BYTES:-536870912}
+      MAX_ADMIN_BODY_BYTES: ${BUCKETMUX_MAX_ADMIN_BODY_BYTES:-1048576}
     volumes:
       - ./examples/config.single.yaml:/config/config.yaml:ro
       - bucketmux-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    logging: *default-logging
     restart: unless-stopped
 
 volumes:

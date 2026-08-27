@@ -23,14 +23,18 @@ func TestListProviderHealthLocal(t *testing.T) {
 			Bucket:        "images",
 			CapacityBytes: 1024 * 1024,
 			Priority:      1,
-			Enabled:       boolPtr(true),
+			Enabled:       new(true),
 			Settings:      map[string]string{"path": filepath.Join(dataDir, "objects")},
 		}},
 	})
 	if err != nil {
 		t.Fatalf("NewService() error = %v", err)
 	}
-	defer svc.Close()
+	t.Cleanup(func() {
+		if err := svc.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
 	health, err := svc.ListProviderHealth(context.Background())
 	if err != nil {

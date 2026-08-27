@@ -60,3 +60,28 @@ func TestObjectLifecycleCompatibility(t *testing.T) {
 		t.Fatalf("head after delete status = %d body=%s", res.Code, res.Body.String())
 	}
 }
+
+func TestPutObjectRejectsOversizedKnownAndChunkedBodies(t *testing.T) {
+	handler, cleanup := newGatewayTestHandler(t)
+	defer cleanup()
+	handler.svc.Config.Server.MaxUploadBytes = 4
+
+	for _, testCase := range []struct {
+		name    string
+		chunked bool
+	}{{name: "known length"}, {name: "chunked", chunked: true}} {
+		t.Run(testCase.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/images/too-large-"+strings.ReplaceAll(testCase.name, " ", "-")+".txt", strings.NewReader("12345"))
+			if testCase.chunked {
+				req.ContentLength = -1
+				req.TransferEncoding = []string{"chunked"}
+			}
+			addAuth(req)
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			if res.Code != http.StatusRequestEntityTooLarge || !strings.Contains(res.Body.String(), "EntityTooLarge") {
+				t.Fatalf("oversized PUT status=%d body=%s", res.Code, res.Body.String())
+			}
+		})
+	}
+}

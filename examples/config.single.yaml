@@ -1,12 +1,18 @@
 server:
   addr: ":8080"
   data_dir: "/data"
+  multipart_staging_dir: "/data/multipart"
+  max_upload_bytes: 5368709120
+  max_multipart_part_bytes: 536870912
+  max_admin_body_bytes: 1048576
   master_key: "change-me-use-MASTER_KEY-env"
 
 store:
   kind: "sqlite"
   sqlite:
     path: "/data/switcher.db"
+    max_open_conns: 10
+    max_idle_conns: 10
 
 s3:
   access_key: "local-access-key"

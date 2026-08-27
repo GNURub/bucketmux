@@ -75,7 +75,7 @@ func newGatewayTestHandler(t *testing.T) (*Handler, func()) {
 			Bucket:        "images",
 			CapacityBytes: 1024 * 1024,
 			Priority:      1,
-			Enabled:       boolPtr(true),
+			Enabled:       new(true),
 			Settings:      map[string]string{"path": filepath.Join(dataDir, "objects")},
 		}},
 	})

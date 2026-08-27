@@ -27,11 +27,15 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	if dsn == "" {
 		t.Fatal("POSTGRES_DSN is required")
 	}
-	s, err := OpenPostgres(config.PostgresStoreConfig{DSN: dsn, MaxOpenConns: 5, MaxIdleConns: 2})
+	s, err := OpenPostgres(config.PostgresStoreConfig{DSN: dsn, MaxOpenConns: 1, MaxIdleConns: 1})
 	if err != nil {
 		t.Fatalf("OpenPostgres() error = %v", err)
 	}
-	defer s.Close()
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
 	ctx := context.Background()
 	suffix := time.Now().UTC().Format("20060102150405")
@@ -56,14 +60,40 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	if _, err := s.GetObject(ctx, bucketName, key); err != nil {
 		t.Fatalf("GetObject() error = %v", err)
 	}
-	if err := s.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: bucketName, Key: key, ProviderAccountID: providerID, Status: "succeeded"}); err != nil {
+	if joinedObject, joinedProvider, err := s.GetObjectWithProvider(ctx, bucketName, key); err != nil || joinedObject.Key != key || joinedProvider.ID != providerID {
+		t.Fatalf("GetObjectWithProvider() = %+v, %+v, %v", joinedObject, joinedProvider, err)
+	}
+	if err := s.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: bucketName, Key: key, ProviderAccountID: providerID, Status: "pending"}); err != nil {
 		t.Fatalf("UpsertObjectReplica() error = %v", err)
+	}
+	if replica, claimed, err := s.ClaimNextObjectReplica(ctx); err != nil || !claimed || replica.Key != key {
+		t.Fatalf("ClaimNextObjectReplica() = %+v, %v, %v", replica, claimed, err)
+	}
+	if err := s.TouchObjectReplica(ctx, bucketName, key, providerID); err != nil {
+		t.Fatalf("TouchObjectReplica() error = %v", err)
 	}
 	hookID := "pg-hook-" + suffix
 	if err := s.UpsertHook(ctx, domain.Hook{ID: hookID, Name: hookID, Kind: domain.HookKindHTTP, URL: "https://example.com/hook", Method: "POST", Events: []string{domain.HookEventObjectCreated}, Enabled: true}); err != nil {
 		t.Fatalf("UpsertHook() error = %v", err)
 	}
-	if err := s.CreateHookDelivery(ctx, domain.HookDelivery{ID: "pg-delivery-" + suffix, HookID: hookID, Event: domain.HookEventObjectCreated, Bucket: bucketName, Key: key, PayloadJSON: `{}`, Status: domain.HookDeliveryStatusPending}); err != nil {
+	deliveryID := "pg-delivery-" + suffix
+	if err := s.CreateHookDelivery(ctx, domain.HookDelivery{ID: deliveryID, HookID: hookID, Event: domain.HookEventObjectCreated, Bucket: bucketName, Key: key, PayloadJSON: `{}`, Status: domain.HookDeliveryStatusPending}); err != nil {
 		t.Fatalf("CreateHookDelivery() error = %v", err)
+	}
+	if delivery, claimed, err := s.ClaimNextHookDelivery(ctx, time.Now().UTC().Add(time.Second)); err != nil || !claimed || delivery.ID != deliveryID || delivery.Status != domain.HookDeliveryStatusRunning {
+		t.Fatalf("ClaimNextHookDelivery() = %+v, %v, %v", delivery, claimed, err)
+	}
+	if err := s.TouchHookDelivery(ctx, deliveryID); err != nil {
+		t.Fatalf("TouchHookDelivery() error = %v", err)
+	}
+	jobID := "pg-migration-" + suffix
+	if err := s.CreateMigrationJob(ctx, domain.MigrationJob{ID: jobID, Bucket: bucketName, SourceProviderID: providerID, TargetProviderID: providerID + "-target", Mode: domain.MigrationModeCopy, Status: domain.MigrationStatusPending}); err != nil {
+		t.Fatalf("CreateMigrationJob() error = %v", err)
+	}
+	if job, claimed, err := s.ClaimNextMigrationJob(ctx); err != nil || !claimed || job.ID != jobID || job.Status != domain.MigrationStatusRunning {
+		t.Fatalf("ClaimNextMigrationJob() = %+v, %v, %v", job, claimed, err)
+	}
+	if err := s.TouchMigrationJob(ctx, jobID); err != nil {
+		t.Fatalf("TouchMigrationJob() error = %v", err)
 	}
 }

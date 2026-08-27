@@ -36,23 +36,40 @@ func (s *Service) UploadPart(ctx context.Context, uploadID string, partNumber in
 	if _, err := s.Store.GetMultipartUpload(ctx, uploadID); err != nil {
 		return domain.MultipartPart{}, err
 	}
-	path := filepath.Join(s.Config.Server.DataDir, "multipart", uploadID, fmt.Sprintf("%05d.part", partNumber))
+	path := filepath.Join(s.Config.Server.MultipartStagingDir, uploadID, fmt.Sprintf("%05d.part", partNumber))
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return domain.MultipartPart{}, fmt.Errorf("create multipart dir: %w", err)
 	}
-	file, err := os.Create(path)
+	file, err := os.CreateTemp(filepath.Dir(path), ".bucketmux-part-*.tmp")
 	if err != nil {
 		return domain.MultipartPart{}, fmt.Errorf("create multipart part: %w", err)
 	}
+	tempPath := file.Name()
+	committed := false
+	defer func() {
+		_ = file.Close()
+		if !committed {
+			_ = os.Remove(tempPath)
+		}
+	}()
 	hash := sha256.New()
-	written, copyErr := io.Copy(file, io.TeeReader(body, hash))
-	closeErr := file.Close()
+	written, copyErr := io.Copy(file, io.TeeReader(io.LimitReader(body, s.Config.Server.MaxMultipartPartBytes+1), hash))
 	if copyErr != nil {
 		return domain.MultipartPart{}, fmt.Errorf("write multipart part: %w", copyErr)
 	}
-	if closeErr != nil {
-		return domain.MultipartPart{}, fmt.Errorf("close multipart part: %w", closeErr)
+	if written > s.Config.Server.MaxMultipartPartBytes {
+		return domain.MultipartPart{}, fmt.Errorf("%w: multipart part maximum is %d bytes", ErrUploadTooLarge, s.Config.Server.MaxMultipartPartBytes)
 	}
+	if err := file.Sync(); err != nil {
+		return domain.MultipartPart{}, fmt.Errorf("sync multipart part: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return domain.MultipartPart{}, fmt.Errorf("close multipart part: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return domain.MultipartPart{}, fmt.Errorf("commit multipart part: %w", err)
+	}
+	committed = true
 	checksum := hex.EncodeToString(hash.Sum(nil))
 	part := domain.MultipartPart{UploadID: uploadID, PartNumber: partNumber, Path: path, Size: written, ETag: `"` + checksum + `"`, ChecksumSHA256: checksum}
 	if err := s.Store.UpsertMultipartPart(ctx, part); err != nil {
@@ -73,6 +90,9 @@ func (s *Service) CompleteMultipartUpload(ctx context.Context, uploadID string, 
 	ordered, totalSize, err := orderMultipartParts(parts, requestedParts)
 	if err != nil {
 		return domain.ObjectRecord{}, err
+	}
+	if totalSize > s.Config.Server.MaxUploadBytes {
+		return domain.ObjectRecord{}, fmt.Errorf("%w: maximum is %d bytes", ErrUploadTooLarge, s.Config.Server.MaxUploadBytes)
 	}
 	reader, closeFn, err := openMultipartReader(ordered)
 	if err != nil {
@@ -103,7 +123,7 @@ func (s *Service) cleanupMultipart(ctx context.Context, uploadID string, parts [
 	for _, part := range parts {
 		_ = os.Remove(part.Path)
 	}
-	_ = os.RemoveAll(filepath.Join(s.Config.Server.DataDir, "multipart", uploadID))
+	_ = os.RemoveAll(filepath.Join(s.Config.Server.MultipartStagingDir, uploadID))
 	return s.Store.DeleteMultipartUpload(ctx, uploadID)
 }
 

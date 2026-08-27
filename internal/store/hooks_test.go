@@ -14,7 +14,11 @@ func TestStoreHooksCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	defer s.Close()
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
 	ctx := context.Background()
 	hook := domain.Hook{
@@ -71,7 +75,11 @@ func TestStoreHookDeliveriesCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	defer s.Close()
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
 	ctx := context.Background()
 	hook := domain.Hook{ID: "notify-delivery", Name: "Notify delivery", Kind: domain.HookKindHTTP, URL: "https://example.com/hook", Method: "POST", Events: []string{domain.HookEventObjectCreated}, Enabled: true}
@@ -100,9 +108,15 @@ func TestStoreHookDeliveriesCRUD(t *testing.T) {
 	if len(pending) != 1 || pending[0].ID != delivery.ID {
 		t.Fatalf("pending deliveries = %+v", pending)
 	}
-	stored, err := s.GetHookDelivery(ctx, delivery.ID)
+	stored, claimed, err := s.ClaimNextHookDelivery(ctx, now.Add(time.Second))
 	if err != nil {
-		t.Fatalf("GetHookDelivery() error = %v", err)
+		t.Fatalf("ClaimNextHookDelivery() error = %v", err)
+	}
+	if !claimed || stored.ID != delivery.ID || stored.Status != domain.HookDeliveryStatusRunning {
+		t.Fatalf("claimed delivery = %+v, claimed=%v", stored, claimed)
+	}
+	if _, claimed, err := s.ClaimNextHookDelivery(ctx, now.Add(time.Second)); err != nil || claimed {
+		t.Fatalf("second ClaimNextHookDelivery() claimed=%v error=%v, want false", claimed, err)
 	}
 	stored.Status = domain.HookDeliveryStatusSucceeded
 	stored.Attempts = 1

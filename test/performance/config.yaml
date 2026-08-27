@@ -1,0 +1,34 @@
+server:
+  addr: "127.0.0.1:18089"
+  data_dir: "./data"
+  db_path: "./data/bucketmux.db"
+  master_key: "k6-performance-master-key"
+
+store:
+  kind: "sqlite"
+  sqlite:
+    path: "./data/bucketmux.db"
+    max_open_conns: 10
+    max_idle_conns: 10
+
+s3:
+  access_key: "k6-access-key"
+  secret_key: "k6-secret-key"
+  region: "us-east-1"
+
+admin:
+  enabled: false
+
+buckets:
+  - name: "performance"
+
+providers:
+  - id: "performance-local"
+    name: "Performance local disk"
+    kind: "local"
+    bucket: "performance"
+    capacity_bytes: 10737418240
+    priority: 1
+    enabled: true
+    settings:
+      path: "local-provider"

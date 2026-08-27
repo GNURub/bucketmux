@@ -9,6 +9,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ func NewLocalAdapter(baseDir string) *LocalAdapter {
 }
 
 func (a *LocalAdapter) Put(ctx context.Context, account domain.ProviderAccount, input domain.PutObjectInput, body io.Reader) (domain.StoredObject, error) {
-	remoteKey, err := safeRelativePath(input.Key)
+	remoteKey, err := safeRelativePath(input.StorageKey())
 	if err != nil {
 		return domain.StoredObject{}, err
 	}
@@ -35,16 +36,33 @@ func (a *LocalAdapter) Put(ctx context.Context, account domain.ProviderAccount, 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return domain.StoredObject{}, fmt.Errorf("create local object dir: %w", err)
 	}
-	file, err := os.Create(path)
+	file, err := os.CreateTemp(filepath.Dir(path), ".bucketmux-upload-*.tmp")
 	if err != nil {
-		return domain.StoredObject{}, fmt.Errorf("create local object: %w", err)
+		return domain.StoredObject{}, fmt.Errorf("create local object temp file: %w", err)
 	}
-	defer file.Close()
+	tempPath := file.Name()
+	committed := false
+	defer func() {
+		_ = file.Close()
+		if !committed {
+			_ = os.Remove(tempPath)
+		}
+	}()
 	hash := sha256.New()
 	written, err := io.Copy(file, io.TeeReader(body, hash))
 	if err != nil {
 		return domain.StoredObject{}, fmt.Errorf("write local object: %w", err)
 	}
+	if err := file.Sync(); err != nil {
+		return domain.StoredObject{}, fmt.Errorf("sync local object: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return domain.StoredObject{}, fmt.Errorf("close local object: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return domain.StoredObject{}, fmt.Errorf("commit local object: %w", err)
+	}
+	committed = true
 	checksum := hex.EncodeToString(hash.Sum(nil))
 	contentType := input.ContentType
 	if contentType == "" {
@@ -59,6 +77,77 @@ func (a *LocalAdapter) Put(ctx context.Context, account domain.ProviderAccount, 
 		ETag:              `"` + checksum + `"`,
 		ChecksumSHA256:    checksum,
 	}, nil
+}
+
+func (a *LocalAdapter) DiscoverBuckets(_ context.Context, account domain.ProviderAccount) ([]domain.ProviderBucket, error) {
+	root, err := a.providerRoot(account)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return []domain.ProviderBucket{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list local buckets: %w", err)
+	}
+	result := make([]domain.ProviderBucket, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			result = append(result, domain.ProviderBucket{Name: entry.Name()})
+		}
+	}
+	return result, nil
+}
+
+func (a *LocalAdapter) ListObjects(_ context.Context, account domain.ProviderAccount, bucket, prefix, continuationToken string, limit int) (domain.ProviderObjectPage, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	root, err := a.objectPath(account, bucket, "inventory-probe")
+	if err != nil {
+		return domain.ProviderObjectPage{}, err
+	}
+	root = filepath.Dir(root)
+	objects := make([]domain.ProviderObject, 0)
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		key, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		key = filepath.ToSlash(key)
+		if key <= continuationToken || !strings.HasPrefix(key, prefix) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		objects = append(objects, domain.ProviderObject{Key: key, Size: info.Size(), ContentType: mime.TypeByExtension(filepath.Ext(key)), LastModified: info.ModTime().UTC()})
+		if len(objects) > limit {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return domain.ProviderObjectPage{Objects: []domain.ProviderObject{}}, nil
+	}
+	if err != nil {
+		return domain.ProviderObjectPage{}, fmt.Errorf("inventory local objects: %w", err)
+	}
+	slices.SortFunc(objects, func(a, b domain.ProviderObject) int { return strings.Compare(a.Key, b.Key) })
+	page := domain.ProviderObjectPage{Objects: objects}
+	if len(page.Objects) > limit {
+		page.Objects = page.Objects[:limit]
+		page.NextContinuationToken = page.Objects[len(page.Objects)-1].Key
+	}
+	return page, nil
 }
 
 func (a *LocalAdapter) Get(ctx context.Context, account domain.ProviderAccount, obj domain.ObjectRecord) (io.ReadCloser, domain.ObjectRecord, error) {
@@ -167,7 +256,7 @@ func safePathSegment(value string) (string, error) {
 }
 
 func safeRelativePath(value string) (string, error) {
-	value = strings.Trim(strings.TrimSpace(value), `/\\`)
+	value = strings.Trim(strings.TrimSpace(value), `/\`)
 	if value == "" || value == "." {
 		return "", fmt.Errorf("object key is required")
 	}

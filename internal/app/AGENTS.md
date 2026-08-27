@@ -22,8 +22,10 @@
 
 - `NewService` owns composition. Add new provider adapters there with `provider.Entry(kind, adapter)`.
 - `Bootstrap` upserts configured buckets and providers into the store; provider `SecretKey` is encrypted before persistence.
-- Workers are started by `NewService` and stopped through `Service.Close`; add workers to `workerWG` and use `cancelWorkers` context.
-- Worker leases use `tryWorkerLease(name)`; names currently include `hooks`, `migration`, and `replication`.
+- Workers are started by `NewService` and stopped through `Service.Close`; run durable work through `runDurableWorker` so claim, recovery, metrics, cancellation, and wake-up behavior stay centralized.
+- Database status transitions own work. Redis leases serialize only the short claim operation and must never be held during provider or hook I/O.
+- Long-running work must heartbeat its claimed row so another instance cannot recover it while provider I/O is still active.
+- Hook delivery is at-least-once. Receivers can deduplicate with `X-BucketMux-Delivery-ID`; never launch hook goroutines outside the tracked worker lifecycle.
 - `PutObject` chooses a primary provider through `Router.Choose`, writes to the provider first, then indexes in `Store`.
 - Replication is asynchronous: primary object writes enqueue replica rows when bucket replication targets exist.
 - Multipart and replicated uploads may spool to temp files under `Config.Server.DataDir`; always clean temp files.

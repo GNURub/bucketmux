@@ -30,6 +30,7 @@ type Hook struct {
 
 const (
 	HookDeliveryStatusPending   = "pending"
+	HookDeliveryStatusRunning   = "running"
 	HookDeliveryStatusSucceeded = "succeeded"
 	HookDeliveryStatusFailed    = "failed"
 )
@@ -49,4 +50,13 @@ type HookDelivery struct {
 	LastError      string    `json:"last_error,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type BucketNotification struct {
+	ID     string `json:"id"`
+	Bucket string `json:"bucket"`
+	HookID string `json:"hook_id"`
+	Event  string `json:"event"`
+	Prefix string `json:"prefix,omitempty"`
+	Suffix string `json:"suffix,omitempty"`
 }

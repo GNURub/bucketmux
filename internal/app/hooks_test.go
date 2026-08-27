@@ -27,6 +27,9 @@ func TestHTTPHooksFireForObjectEvents(t *testing.T) {
 		if event := r.Header.Get("X-BucketMux-Event"); event == "" {
 			t.Error("missing X-BucketMux-Event header")
 		}
+		if deliveryID := r.Header.Get("X-BucketMux-Delivery-ID"); deliveryID == "" {
+			t.Error("missing X-BucketMux-Delivery-ID header")
+		}
 		if secret := r.Header.Get("X-Webhook-Secret"); secret != "super-secret" {
 			t.Errorf("X-Webhook-Secret = %q, want super-secret", secret)
 		}
@@ -108,6 +111,53 @@ func TestHTTPHooksRetryFailedDeliveries(t *testing.T) {
 	}
 }
 
+func TestServiceCloseWaitsForActiveHookDelivery(t *testing.T) {
+	svc, cleanup := newHookTestService(t)
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			cleanup()
+		}
+	})
+
+	started := make(chan struct{})
+	requestCanceled := make(chan struct{})
+	svc.HookHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		<-r.Context().Done()
+		close(requestCanceled)
+		return nil, r.Context().Err()
+	})}
+	if err := svc.UpsertHookFromAdmin(context.Background(), domain.Hook{ID: "shutdown-test", Name: "Shutdown test", Kind: domain.HookKindHTTP, URL: "http://example.test/shutdown", Method: http.MethodPost, Events: []string{domain.HookEventObjectCreated}, Enabled: true}); err != nil {
+		t.Fatalf("UpsertHookFromAdmin() error = %v", err)
+	}
+	if _, err := svc.PutObject(context.Background(), domain.PutObjectInput{Bucket: "images", Key: "hooks/shutdown.txt", Size: 8, ContentType: "text/plain"}, strings.NewReader("shutdown")); err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for hook request")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- svc.Close() }()
+	select {
+	case err := <-closeDone:
+		closed = true
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Service.Close() did not wait for and cancel active hook delivery")
+	}
+	select {
+	case <-requestCanceled:
+	default:
+		t.Fatal("active hook request was not canceled")
+	}
+}
+
 func waitHookPayload(t *testing.T, received <-chan HookPayload) HookPayload {
 	t.Helper()
 	select {
@@ -153,7 +203,7 @@ func newHookTestService(t *testing.T) (*Service, func()) {
 			Bucket:        "images",
 			CapacityBytes: 1024 * 1024,
 			Priority:      1,
-			Enabled:       boolPtr(true),
+			Enabled:       new(true),
 			Settings:      map[string]string{"path": filepath.Join(dataDir, "objects")},
 		}},
 	})
@@ -162,8 +212,6 @@ func newHookTestService(t *testing.T) (*Service, func()) {
 	}
 	return svc, func() { _ = svc.Close() }
 }
-
-func boolPtr(v bool) *bool { return &v }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

@@ -11,7 +11,11 @@ import (
 	"github.com/gnurub/bucketmux/internal/domain"
 )
 
-const MigrationMoveConfirmationPhrase = "Migrar permanentemente"
+const MigrationMoveConfirmationPhrase = "Migrate permanently"
+
+const migrationWorkerInterval = 2 * time.Second
+const migrationHeartbeatInterval = 30 * time.Second
+const migrationWorkStaleAfter = 15 * time.Minute
 
 type CreateMigrationJobInput struct {
 	Bucket           string
@@ -63,34 +67,36 @@ func (s *Service) CreateMigrationJob(ctx context.Context, input CreateMigrationJ
 	if err := s.Store.CreateMigrationJob(ctx, job); err != nil {
 		return domain.MigrationJob{}, err
 	}
+	signalWorker(s.migrationWake)
 	return s.Store.GetMigrationJob(ctx, job.ID)
 }
 
 func (s *Service) StartMigrationWorker(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		lease, leased := s.tryWorkerLease(ctx, "migration")
-		if leased {
-			job, ok, err := s.Store.ClaimNextMigrationJob(ctx)
-			if err == nil && ok {
-				_ = s.RunMigrationJob(ctx, job.ID)
-				_ = lease.Release(ctx)
-				continue
+	s.runDurableWorker(ctx, durableWorker{
+		name:              "migration",
+		interval:          migrationWorkerInterval,
+		heartbeatInterval: migrationHeartbeatInterval,
+		staleAfter:        migrationWorkStaleAfter,
+		wake:              s.migrationWake,
+		recover: func(ctx context.Context, cutoff time.Time) error {
+			_, err := s.Store.RecoverStaleMigrationJobs(ctx, cutoff)
+			return err
+		},
+		claim: func(ctx context.Context) (durableWorkItem, bool, error) {
+			job, claimed, err := s.Store.ClaimNextMigrationJob(ctx)
+			if err != nil || !claimed {
+				return durableWorkItem{}, claimed, err
 			}
-			_ = lease.Release(ctx)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+			return durableWorkItem{
+				run: func(ctx context.Context) error {
+					return s.RunMigrationJob(ctx, job.ID)
+				},
+				heartbeat: func(ctx context.Context) error {
+					return s.Store.TouchMigrationJob(ctx, job.ID)
+				},
+			}, true, nil
+		},
+	})
 }
 
 func (s *Service) RunMigrationJob(ctx context.Context, id string) error {
@@ -195,7 +201,7 @@ func (s *Service) migrateObjectToProvider(ctx context.Context, obj domain.Object
 	if err != nil {
 		return err
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	stored, err := s.putOnProvider(ctx, targetAccount, domain.PutObjectInput{Bucket: obj.Bucket, Key: obj.Key, Size: obj.Size, ContentType: obj.ContentType}, body)
 	if err != nil {
 		return err

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -124,6 +125,48 @@ func TestUppyMultipartFlow(t *testing.T) {
 	}
 }
 
+func TestUppyV6SignRequestContract(t *testing.T) {
+	mux, cleanup := newUppyTestMux(t)
+	defer cleanup()
+
+	tests := []struct {
+		name       string
+		method     string
+		uploadID   string
+		partNumber int
+		query      url.Values
+	}{
+		{name: "direct PUT", method: http.MethodPut},
+		{name: "create multipart", method: http.MethodPost, query: url.Values{"uploads": {""}}},
+		{name: "upload part", method: http.MethodPut, uploadID: "upload-1", partNumber: 2, query: url.Values{"uploadId": {"upload-1"}, "partNumber": {"2"}}},
+		{name: "get object", method: http.MethodGet},
+		{name: "list parts", method: http.MethodGet, uploadID: "upload-1", query: url.Values{"uploadId": {"upload-1"}}},
+		{name: "complete multipart", method: http.MethodPost, uploadID: "upload-1", query: url.Values{"uploadId": {"upload-1"}}},
+		{name: "abort multipart", method: http.MethodDelete, uploadID: "upload-1", query: url.Values{"uploadId": {"upload-1"}}},
+		{name: "delete object", method: http.MethodDelete},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			signed := postJSON[map[string]string](t, mux, "http://bucketmux.local/uppy/s3/sign", map[string]any{
+				"method": test.method, "bucket": "images", "key": "uppy/v6.txt", "uploadId": test.uploadID, "partNumber": test.partNumber, "expiresIn": 60,
+			})
+			parsed, err := url.Parse(signed["url"])
+			if err != nil {
+				t.Fatalf("Parse(%q) error = %v", signed["url"], err)
+			}
+			if parsed.Path != "/images/uppy/v6.txt" || parsed.Query().Get("X-Amz-Signature") == "" {
+				t.Fatalf("unexpected signed URL = %s", parsed)
+			}
+			for name, values := range test.query {
+				actual, exists := parsed.Query()[name]
+				if !exists || len(actual) != len(values) || actual[0] != values[0] {
+					t.Fatalf("query %s = %v, want %v in %s", name, actual, values, parsed)
+				}
+			}
+		})
+	}
+}
+
 func postJSON[T any](t *testing.T, mux http.Handler, rawURL string, payload any) T {
 	t.Helper()
 	data, err := json.Marshal(payload)
@@ -159,7 +202,7 @@ func newUppyTestMux(t *testing.T) (*http.ServeMux, func()) {
 			Bucket:        "images",
 			CapacityBytes: 1024 * 1024,
 			Priority:      1,
-			Enabled:       boolPtr(true),
+			Enabled:       new(true),
 			Settings:      map[string]string{"path": filepath.Join(dataDir, "objects")},
 		}},
 	})

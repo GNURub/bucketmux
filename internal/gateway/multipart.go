@@ -25,6 +25,10 @@ func (h *Handler) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "uploadId and numeric partNumber are required")
 		return
 	}
+	if r.ContentLength > h.svc.Config.Server.MaxMultipartPartBytes {
+		writeS3Error(w, http.StatusRequestEntityTooLarge, "EntityTooLarge", "multipart part exceeds the configured limit")
+		return
+	}
 	part, err := h.svc.UploadPart(r.Context(), uploadID, partNumber, r.Body)
 	if err != nil {
 		h.writeObjectError(w, err)

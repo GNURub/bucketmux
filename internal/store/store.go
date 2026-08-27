@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +43,7 @@ func OpenConfig(cfg config.StoreConfig, legacyDBPath string) (*Store, error) {
 		if path == "" {
 			path = legacyDBPath
 		}
-		return OpenSQLite(path)
+		return openSQLite(path, cfg.SQLite.MaxOpenConns, cfg.SQLite.MaxIdleConns)
 	case "postgres":
 		return OpenPostgres(cfg.Postgres)
 	default:
@@ -51,10 +52,25 @@ func OpenConfig(cfg config.StoreConfig, legacyDBPath string) (*Store, error) {
 }
 
 func OpenSQLite(path string) (*Store, error) {
+	return openSQLite(path, 10, 10)
+}
+
+func openSQLite(path string, maxOpenConns, maxIdleConns int) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// SQLite permits concurrent WAL readers but still serializes writes. Keeping
+	// the pool bounded avoids connection churn and lock contention under mixed
+	// object workloads while retaining enough connections for parallel reads.
+	if maxOpenConns <= 0 {
+		maxOpenConns = 10
+	}
+	if maxIdleConns <= 0 {
+		maxIdleConns = maxOpenConns
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
 	s := &Store{db: db, dialect: dialectSQLite}
 	if err := db.PingContext(context.Background()); err != nil {
 		_ = db.Close()
@@ -92,6 +108,10 @@ func OpenPostgres(cfg config.PostgresStoreConfig) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
 func (s *Store) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	return s.db.ExecContext(ctx, s.rebind(query), args...)
 }
@@ -114,7 +134,7 @@ func (s *Store) rebind(query string) string {
 	for _, ch := range query {
 		if ch == '?' {
 			builder.WriteByte('$')
-			builder.WriteString(fmt.Sprintf("%d", placeholder))
+			builder.WriteString(strconv.Itoa(placeholder))
 			placeholder++
 			continue
 		}
@@ -124,6 +144,34 @@ func (s *Store) rebind(query string) string {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
+	if s.dialect == dialectPostgres {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin postgres migration: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		// PostgreSQL's IF NOT EXISTS checks are not atomic across concurrent DDL.
+		// Serialize schema setup so multiple BucketMux replicas can safely start
+		// against a brand-new shared database at the same time.
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(7334247568550895608)"); err != nil {
+			return fmt.Errorf("lock postgres migration: %w", err)
+		}
+		if err := s.migrateWith(ctx, tx); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit postgres migration: %w", err)
+		}
+		return nil
+	}
+	return s.migrateWith(ctx, s.db)
+}
+
+type migrationExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (s *Store) migrateWith(ctx context.Context, executor migrationExecer) error {
 	schema := `
 CREATE TABLE IF NOT EXISTS provider_accounts (
   id TEXT PRIMARY KEY,
@@ -146,6 +194,13 @@ CREATE TABLE IF NOT EXISTS buckets (
   name TEXT PRIMARY KEY,
   replication_enabled INTEGER NOT NULL DEFAULT 0,
   replication_provider_ids_json TEXT NOT NULL DEFAULT '[]',
+  versioning_enabled INTEGER NOT NULL DEFAULT 0,
+  trash_enabled INTEGER NOT NULL DEFAULT 0,
+  trash_retention_days INTEGER NOT NULL DEFAULT 30,
+  object_lock_enabled INTEGER NOT NULL DEFAULT 0,
+  default_retention_mode TEXT NOT NULL DEFAULT '',
+  default_retention_days INTEGER NOT NULL DEFAULT 0,
+  lifecycle_rules_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -166,6 +221,58 @@ CREATE TABLE IF NOT EXISTS objects (
   FOREIGN KEY (provider_account_id) REFERENCES provider_accounts(id)
 );
 CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects(bucket, key);
+CREATE TABLE IF NOT EXISTS object_attributes (
+  bucket TEXT NOT NULL,
+  key TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  tags_json TEXT NOT NULL DEFAULT '{}',
+  version_id TEXT NOT NULL DEFAULT '',
+  retention_mode TEXT NOT NULL DEFAULT '',
+  retain_until TEXT NOT NULL DEFAULT '',
+  legal_hold INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (bucket, key),
+  FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS object_versions (
+  version_id TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  key TEXT NOT NULL,
+  provider_account_id TEXT NOT NULL,
+  remote_bucket TEXT NOT NULL,
+  remote_key TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  content_type TEXT NOT NULL DEFAULT '',
+  etag TEXT NOT NULL DEFAULT '',
+  checksum_sha256 TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  tags_json TEXT NOT NULL DEFAULT '{}',
+  retention_mode TEXT NOT NULL DEFAULT '',
+  retain_until TEXT NOT NULL DEFAULT '',
+  legal_hold INTEGER NOT NULL DEFAULT 0,
+  is_delete_marker INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (bucket, key, version_id)
+);
+CREATE INDEX IF NOT EXISTS idx_object_versions_key ON object_versions(bucket, key, created_at DESC);
+CREATE TABLE IF NOT EXISTS trash_objects (
+  id TEXT PRIMARY KEY,
+  bucket TEXT NOT NULL,
+  key TEXT NOT NULL,
+  provider_account_id TEXT NOT NULL,
+  remote_bucket TEXT NOT NULL,
+  remote_key TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  content_type TEXT NOT NULL DEFAULT '',
+  etag TEXT NOT NULL DEFAULT '',
+  checksum_sha256 TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  tags_json TEXT NOT NULL DEFAULT '{}',
+  deleted_at TEXT NOT NULL,
+  purge_after TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trash_objects_recent ON trash_objects(deleted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trash_objects_purge ON trash_objects(purge_after);
 CREATE TABLE IF NOT EXISTS object_replicas (
   bucket TEXT NOT NULL,
   key TEXT NOT NULL,
@@ -232,6 +339,17 @@ CREATE TABLE IF NOT EXISTS hook_deliveries (
   updated_at TEXT NOT NULL,
   FOREIGN KEY (hook_id) REFERENCES hooks(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS bucket_notifications (
+  id TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  hook_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  prefix TEXT NOT NULL DEFAULT '',
+  suffix TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (bucket, id, event),
+  FOREIGN KEY (hook_id) REFERENCES hooks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_bucket_notifications_bucket ON bucket_notifications(bucket);
 CREATE INDEX IF NOT EXISTS idx_hook_deliveries_recent ON hook_deliveries(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_hook_deliveries_pending ON hook_deliveries(status, next_attempt_at);
 CREATE TABLE IF NOT EXISTS migration_jobs (
@@ -267,22 +385,102 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_events_recent ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action, created_at DESC);
+CREATE TABLE IF NOT EXISTS access_credentials (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  access_key TEXT NOT NULL UNIQUE,
+  secret_encrypted TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'read-write',
+  permissions_json TEXT NOT NULL DEFAULT '[]',
+  bucket_patterns_json TEXT NOT NULL DEFAULT '["*"]',
+  prefix_patterns_json TEXT NOT NULL DEFAULT '["*"]',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  expires_at TEXT NOT NULL DEFAULT '',
+  last_used_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_credentials_access_key ON access_credentials(access_key);
+CREATE TABLE IF NOT EXISTS inventory_jobs (
+  id TEXT PRIMARY KEY,
+  provider_account_id TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  remote_bucket TEXT NOT NULL DEFAULT '',
+  prefix TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  discovered_objects INTEGER NOT NULL DEFAULT 0,
+  imported_objects INTEGER NOT NULL DEFAULT 0,
+  missing_objects INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (provider_account_id) REFERENCES provider_accounts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_jobs_recent ON inventory_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_inventory_jobs_status ON inventory_jobs(status, created_at);
+CREATE TABLE IF NOT EXISTS repair_jobs (
+  id TEXT PRIMARY KEY,
+  bucket TEXT NOT NULL,
+  prefix TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  checked_objects INTEGER NOT NULL DEFAULT 0,
+  repaired_objects INTEGER NOT NULL DEFAULT 0,
+  failed_objects INTEGER NOT NULL DEFAULT 0,
+  current_key TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (bucket) REFERENCES buckets(name)
+);
+CREATE INDEX IF NOT EXISTS idx_repair_jobs_recent ON repair_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repair_jobs_status ON repair_jobs(status, created_at);
+CREATE TABLE IF NOT EXISTS maintenance_leases (
+  name TEXT PRIMARY KEY,
+  leased_until TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `
-	_, err := s.exec(ctx, schema)
+	_, err := executor.ExecContext(ctx, schema)
 	if err != nil {
-		return fmt.Errorf("migrate sqlite: %w", err)
+		return fmt.Errorf("migrate %s: %w", s.dialect, err)
 	}
-	if err := s.addColumnIfMissing(ctx, "hooks", "headers_encrypted", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	if err := s.addColumnIfMissing(ctx, executor, "hooks", "headers_encrypted", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
-	if err := s.addColumnIfMissing(ctx, "buckets", "replication_provider_ids_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+	if err := s.addColumnIfMissing(ctx, executor, "buckets", "replication_provider_ids_json", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"versioning_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"trash_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"trash_retention_days", "INTEGER NOT NULL DEFAULT 30"},
+		{"object_lock_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"default_retention_mode", "TEXT NOT NULL DEFAULT ''"},
+		{"default_retention_days", "INTEGER NOT NULL DEFAULT 0"},
+		{"lifecycle_rules_json", "TEXT NOT NULL DEFAULT '[]'"},
+	} {
+		if err := s.addColumnIfMissing(ctx, executor, "buckets", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err := s.addColumnIfMissing(ctx, executor, "inventory_jobs", "remote_bucket", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *Store) addColumnIfMissing(ctx context.Context, table, column, definition string) error {
-	_, err := s.exec(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
+func (s *Store) addColumnIfMissing(ctx context.Context, executor migrationExecer, table, column, definition string) error {
+	if s.dialect == dialectPostgres {
+		_, err := executor.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", table, column, definition))
+		if err != nil {
+			return fmt.Errorf("add column %s.%s: %w", table, column, err)
+		}
+		return nil
+	}
+	_, err := executor.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition))
 	if err == nil || strings.Contains(err.Error(), "duplicate column name") || strings.Contains(err.Error(), "already exists") {
 		return nil
 	}
@@ -332,7 +530,7 @@ func (s *Store) ListProviders(ctx context.Context, enabledOnly bool) ([]domain.P
 	if err != nil {
 		return nil, fmt.Errorf("list providers: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.ProviderAccount
 	for rows.Next() {
@@ -401,7 +599,7 @@ func (s *Store) ListHooks(ctx context.Context, enabledOnly bool) ([]domain.Hook,
 	if err != nil {
 		return nil, fmt.Errorf("list hooks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []domain.Hook
 	for rows.Next() {
@@ -476,7 +674,7 @@ func (s *Store) ListHookDeliveries(ctx context.Context, limit int) ([]domain.Hoo
 	if err != nil {
 		return nil, fmt.Errorf("list hook deliveries: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanHookDeliveries(rows)
 }
 
@@ -488,8 +686,70 @@ func (s *Store) ListPendingHookDeliveries(ctx context.Context, now time.Time, li
 	if err != nil {
 		return nil, fmt.Errorf("list pending hook deliveries: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanHookDeliveries(rows)
+}
+
+func (s *Store) ClaimNextHookDelivery(ctx context.Context, now time.Time) (domain.HookDelivery, bool, error) {
+	rows, err := s.query(ctx, `SELECT id FROM hook_deliveries WHERE status = ? AND next_attempt_at <= ? ORDER BY next_attempt_at ASC LIMIT 5`, domain.HookDeliveryStatusPending, now.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return domain.HookDelivery{}, false, fmt.Errorf("list claimable hook deliveries: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return domain.HookDelivery{}, false, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return domain.HookDelivery{}, false, err
+	}
+	if err := rows.Close(); err != nil {
+		return domain.HookDelivery{}, false, err
+	}
+	for _, id := range ids {
+		claimedAt := time.Now().UTC().Format(time.RFC3339Nano)
+		res, err := s.exec(ctx, `UPDATE hook_deliveries SET status = ?, updated_at = ? WHERE id = ? AND status = ? AND next_attempt_at <= ?`, domain.HookDeliveryStatusRunning, claimedAt, id, domain.HookDeliveryStatusPending, now.UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return domain.HookDelivery{}, false, fmt.Errorf("claim hook delivery: %w", err)
+		}
+		changed, err := res.RowsAffected()
+		if err != nil {
+			return domain.HookDelivery{}, false, err
+		}
+		if changed == 1 {
+			delivery, err := s.GetHookDelivery(ctx, id)
+			return delivery, true, err
+		}
+	}
+	return domain.HookDelivery{}, false, nil
+}
+
+func (s *Store) RecoverStaleHookDeliveries(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.exec(ctx, `UPDATE hook_deliveries SET status = ?, last_error = ?, updated_at = ? WHERE status = ? AND updated_at < ?`, domain.HookDeliveryStatusPending, "recovered after worker interruption", time.Now().UTC().Format(time.RFC3339Nano), domain.HookDeliveryStatusRunning, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, fmt.Errorf("recover stale hook deliveries: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) TouchHookDelivery(ctx context.Context, id string) error {
+	res, err := s.exec(ctx, `UPDATE hook_deliveries SET updated_at = ? WHERE id = ? AND status = ?`, time.Now().UTC().Format(time.RFC3339Nano), id, domain.HookDeliveryStatusRunning)
+	if err != nil {
+		return fmt.Errorf("touch hook delivery: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) UpdateHookDelivery(ctx context.Context, delivery domain.HookDelivery) error {
@@ -515,20 +775,28 @@ func (s *Store) UpsertBucket(ctx context.Context, b domain.Bucket) error {
 	if err != nil {
 		return fmt.Errorf("encode bucket replication providers: %w", err)
 	}
+	lifecycleRules, err := json.Marshal(b.LifecycleRules)
+	if err != nil {
+		return fmt.Errorf("encode bucket lifecycle rules: %w", err)
+	}
+	if b.TrashRetentionDays <= 0 {
+		b.TrashRetentionDays = 30
+	}
 	_, err = s.exec(ctx, `
-INSERT INTO buckets (name, replication_enabled, replication_provider_ids_json, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(name) DO UPDATE SET replication_enabled=excluded.replication_enabled, replication_provider_ids_json=excluded.replication_provider_ids_json, updated_at=excluded.updated_at
-`, b.Name, boolToInt(b.ReplicationEnabled), string(replicationProviderIDs), b.CreatedAt.Format(time.RFC3339Nano), b.UpdatedAt.Format(time.RFC3339Nano))
+INSERT INTO buckets (name, replication_enabled, replication_provider_ids_json, versioning_enabled, trash_enabled, trash_retention_days, object_lock_enabled, default_retention_mode, default_retention_days, lifecycle_rules_json, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(name) DO UPDATE SET replication_enabled=excluded.replication_enabled, replication_provider_ids_json=excluded.replication_provider_ids_json, versioning_enabled=excluded.versioning_enabled, trash_enabled=excluded.trash_enabled, trash_retention_days=excluded.trash_retention_days, object_lock_enabled=excluded.object_lock_enabled, default_retention_mode=excluded.default_retention_mode, default_retention_days=excluded.default_retention_days, lifecycle_rules_json=excluded.lifecycle_rules_json, updated_at=excluded.updated_at
+`, b.Name, boolToInt(b.ReplicationEnabled), string(replicationProviderIDs), boolToInt(b.VersioningEnabled), boolToInt(b.TrashEnabled), b.TrashRetentionDays, boolToInt(b.ObjectLockEnabled), b.DefaultRetentionMode, b.DefaultRetentionDays, string(lifecycleRules), b.CreatedAt.Format(time.RFC3339Nano), b.UpdatedAt.Format(time.RFC3339Nano))
 	return err
 }
 
 func (s *Store) GetBucket(ctx context.Context, name string) (domain.Bucket, error) {
 	var b domain.Bucket
-	var replication int
+	var replication, versioning, trash, objectLock int
 	var replicationProviderIDsJSON string
+	var lifecycleRulesJSON string
 	var created, updated string
-	err := s.queryRow(ctx, `SELECT name, replication_enabled, replication_provider_ids_json, created_at, updated_at FROM buckets WHERE name = ?`, name).Scan(&b.Name, &replication, &replicationProviderIDsJSON, &created, &updated)
+	err := s.queryRow(ctx, `SELECT name, replication_enabled, replication_provider_ids_json, versioning_enabled, trash_enabled, trash_retention_days, object_lock_enabled, default_retention_mode, default_retention_days, lifecycle_rules_json, created_at, updated_at FROM buckets WHERE name = ?`, name).Scan(&b.Name, &replication, &replicationProviderIDsJSON, &versioning, &trash, &b.TrashRetentionDays, &objectLock, &b.DefaultRetentionMode, &b.DefaultRetentionDays, &lifecycleRulesJSON, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Bucket{}, ErrNotFound
 	}
@@ -536,29 +804,38 @@ func (s *Store) GetBucket(ctx context.Context, name string) (domain.Bucket, erro
 		return b, err
 	}
 	b.ReplicationEnabled = replication == 1
+	b.VersioningEnabled = versioning == 1
+	b.TrashEnabled = trash == 1
+	b.ObjectLockEnabled = objectLock == 1
 	_ = json.Unmarshal([]byte(replicationProviderIDsJSON), &b.ReplicationProviderIDs)
+	_ = json.Unmarshal([]byte(lifecycleRulesJSON), &b.LifecycleRules)
 	b.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	b.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return b, nil
 }
 
 func (s *Store) ListBuckets(ctx context.Context) ([]domain.Bucket, error) {
-	rows, err := s.query(ctx, `SELECT name, replication_enabled, replication_provider_ids_json, created_at, updated_at FROM buckets ORDER BY name ASC`)
+	rows, err := s.query(ctx, `SELECT name, replication_enabled, replication_provider_ids_json, versioning_enabled, trash_enabled, trash_retention_days, object_lock_enabled, default_retention_mode, default_retention_days, lifecycle_rules_json, created_at, updated_at FROM buckets ORDER BY name ASC`)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.Bucket
 	for rows.Next() {
 		var b domain.Bucket
-		var replication int
+		var replication, versioning, trash, objectLock int
 		var replicationProviderIDsJSON string
+		var lifecycleRulesJSON string
 		var created, updated string
-		if err := rows.Scan(&b.Name, &replication, &replicationProviderIDsJSON, &created, &updated); err != nil {
+		if err := rows.Scan(&b.Name, &replication, &replicationProviderIDsJSON, &versioning, &trash, &b.TrashRetentionDays, &objectLock, &b.DefaultRetentionMode, &b.DefaultRetentionDays, &lifecycleRulesJSON, &created, &updated); err != nil {
 			return nil, err
 		}
 		b.ReplicationEnabled = replication == 1
+		b.VersioningEnabled = versioning == 1
+		b.TrashEnabled = trash == 1
+		b.ObjectLockEnabled = objectLock == 1
 		_ = json.Unmarshal([]byte(replicationProviderIDsJSON), &b.ReplicationProviderIDs)
+		_ = json.Unmarshal([]byte(lifecycleRulesJSON), &b.LifecycleRules)
 		b.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		b.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 		out = append(out, b)
@@ -598,19 +875,39 @@ func (s *Store) GetObject(ctx context.Context, bucket, key string) (domain.Objec
 	return obj, err
 }
 
+// GetObjectWithProvider loads the object and its provider from one database
+// snapshot. The gateway hot path uses it to avoid a second round trip while
+// retaining the database as the source of truth for provider configuration.
+func (s *Store) GetObjectWithProvider(ctx context.Context, bucket, key string) (domain.ObjectRecord, domain.ProviderAccount, error) {
+	row := s.queryRow(ctx, `
+SELECT
+  o.bucket, o.key, o.provider_account_id, o.remote_bucket, o.remote_key, o.size,
+  o.content_type, o.etag, o.checksum_sha256, o.replica_status, o.created_at, o.updated_at,
+  p.id, p.name, p.kind, p.endpoint, p.region, p.bucket, p.access_key, p.secret_encrypted,
+  p.capacity_bytes, p.used_bytes, p.priority, p.enabled, p.settings_json, p.created_at, p.updated_at
+FROM objects o
+JOIN provider_accounts p ON p.id = o.provider_account_id
+WHERE o.bucket = ? AND o.key = ?`, bucket, key)
+	obj, account, err := scanObjectWithProvider(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ObjectRecord{}, domain.ProviderAccount{}, ErrNotFound
+	}
+	return obj, account, err
+}
+
 func (s *Store) ListObjects(ctx context.Context, bucket, prefix string, limit int) ([]domain.ObjectRecord, error) {
 	return s.ListObjectsAfter(ctx, bucket, prefix, "", limit)
 }
 
 func (s *Store) ListObjectsAfter(ctx context.Context, bucket, prefix, startAfter string, limit int) ([]domain.ObjectRecord, error) {
-	if limit <= 0 || limit > 1000 {
+	if limit <= 0 || limit > 1001 {
 		limit = 1000
 	}
 	rows, err := s.query(ctx, `SELECT bucket, key, provider_account_id, remote_bucket, remote_key, size, content_type, etag, checksum_sha256, replica_status, created_at, updated_at FROM objects WHERE bucket = ? AND key LIKE ? AND key > ? ORDER BY key ASC LIMIT ?`, bucket, prefix+"%", startAfter, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.ObjectRecord
 	for rows.Next() {
 		obj, err := scanObject(rows)
@@ -653,7 +950,7 @@ func (s *Store) ListObjectReplicas(ctx context.Context, bucket, key string) ([]d
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.ObjectReplica
 	for rows.Next() {
 		replica, err := scanObjectReplica(rows)
@@ -670,16 +967,20 @@ func (s *Store) ClaimNextObjectReplica(ctx context.Context) (domain.ObjectReplic
 	if err != nil {
 		return domain.ObjectReplica{}, false, err
 	}
-	defer rows.Close()
 	var candidates []domain.ObjectReplica
 	for rows.Next() {
 		var replica domain.ObjectReplica
 		if err := rows.Scan(&replica.Bucket, &replica.Key, &replica.ProviderAccountID); err != nil {
+			_ = rows.Close()
 			return domain.ObjectReplica{}, false, err
 		}
 		candidates = append(candidates, replica)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return domain.ObjectReplica{}, false, err
+	}
+	if err := rows.Close(); err != nil {
 		return domain.ObjectReplica{}, false, err
 	}
 	for _, candidate := range candidates {
@@ -704,6 +1005,29 @@ func (s *Store) ClaimNextObjectReplica(ctx context.Context) (domain.ObjectReplic
 	return domain.ObjectReplica{}, false, nil
 }
 
+func (s *Store) RecoverStaleObjectReplicas(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.exec(ctx, `UPDATE object_replicas SET status = ?, error = ?, updated_at = ? WHERE status = ? AND updated_at < ?`, "pending", "recovered after worker interruption", time.Now().UTC().Format(time.RFC3339Nano), "running", cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, fmt.Errorf("recover stale object replicas: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) TouchObjectReplica(ctx context.Context, bucket, key, providerID string) error {
+	res, err := s.exec(ctx, `UPDATE object_replicas SET updated_at = ? WHERE bucket = ? AND key = ? AND provider_account_id = ? AND status = ?`, time.Now().UTC().Format(time.RFC3339Nano), bucket, key, providerID, "running")
+	if err != nil {
+		return fmt.Errorf("touch object replica: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) DeleteObjectReplicas(ctx context.Context, bucket, key string) error {
 	_, err := s.exec(ctx, `DELETE FROM object_replicas WHERE bucket = ? AND key = ?`, bucket, key)
 	return err
@@ -714,7 +1038,7 @@ func (s *Store) ListProviderBucketUsage(ctx context.Context) ([]domain.ProviderB
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.ProviderBucketUsage
 	for rows.Next() {
 		var usage domain.ProviderBucketUsage
@@ -750,7 +1074,7 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]domain.AuditE
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.AuditEvent
 	for rows.Next() {
 		var event domain.AuditEvent
@@ -813,7 +1137,7 @@ func (s *Store) ListMultipartParts(ctx context.Context, uploadID string) ([]doma
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.MultipartPart
 	for rows.Next() {
 		var part domain.MultipartPart
@@ -866,6 +1190,36 @@ func scanObject(row scanner) (domain.ObjectRecord, error) {
 	obj.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	obj.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return obj, nil
+}
+
+func scanObjectWithProvider(row scanner) (domain.ObjectRecord, domain.ProviderAccount, error) {
+	var obj domain.ObjectRecord
+	var account domain.ProviderAccount
+	var objectCreated, objectUpdated string
+	var providerKind string
+	var providerEnabled int
+	var providerSettingsJSON string
+	var providerCreated, providerUpdated string
+	if err := row.Scan(
+		&obj.Bucket, &obj.Key, &obj.ProviderAccountID, &obj.RemoteBucket, &obj.RemoteKey, &obj.Size,
+		&obj.ContentType, &obj.ETag, &obj.ChecksumSHA256, &obj.ReplicaStatus, &objectCreated, &objectUpdated,
+		&account.ID, &account.Name, &providerKind, &account.Endpoint, &account.Region, &account.Bucket,
+		&account.AccessKey, &account.SecretEncrypted, &account.CapacityBytes, &account.UsedBytes,
+		&account.Priority, &providerEnabled, &providerSettingsJSON, &providerCreated, &providerUpdated,
+	); err != nil {
+		return obj, account, err
+	}
+	obj.CreatedAt, _ = time.Parse(time.RFC3339Nano, objectCreated)
+	obj.UpdatedAt, _ = time.Parse(time.RFC3339Nano, objectUpdated)
+	account.Kind = domain.ProviderKind(providerKind)
+	account.Enabled = providerEnabled == 1
+	_ = json.Unmarshal([]byte(providerSettingsJSON), &account.Settings)
+	if account.Settings == nil {
+		account.Settings = map[string]string{}
+	}
+	account.CreatedAt, _ = time.Parse(time.RFC3339Nano, providerCreated)
+	account.UpdatedAt, _ = time.Parse(time.RFC3339Nano, providerUpdated)
+	return obj, account, nil
 }
 
 func scanObjectReplica(row scanner) (domain.ObjectReplica, error) {
@@ -969,7 +1323,7 @@ func (s *Store) ListMigrationJobs(ctx context.Context, limit int) ([]domain.Migr
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []domain.MigrationJob
 	for rows.Next() {
 		job, err := scanMigrationJob(rows)
@@ -986,21 +1340,25 @@ func (s *Store) ClaimNextMigrationJob(ctx context.Context) (domain.MigrationJob,
 	if err != nil {
 		return domain.MigrationJob{}, false, err
 	}
-	defer rows.Close()
 	ids := []string{}
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
 			return domain.MigrationJob{}, false, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return domain.MigrationJob{}, false, err
+	}
+	if err := rows.Close(); err != nil {
 		return domain.MigrationJob{}, false, err
 	}
 	for _, id := range ids {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		res, err := s.exec(ctx, `UPDATE migration_jobs SET status = ?, started_at = ?, updated_at = ? WHERE id = ? AND status = ?`, domain.MigrationStatusRunning, now, now, id, domain.MigrationStatusPending)
+		res, err := s.exec(ctx, `UPDATE migration_jobs SET status = ?, started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END, updated_at = ? WHERE id = ? AND status = ?`, domain.MigrationStatusRunning, now, now, id, domain.MigrationStatusPending)
 		if err != nil {
 			return domain.MigrationJob{}, false, err
 		}
@@ -1011,6 +1369,29 @@ func (s *Store) ClaimNextMigrationJob(ctx context.Context) (domain.MigrationJob,
 		}
 	}
 	return domain.MigrationJob{}, false, nil
+}
+
+func (s *Store) RecoverStaleMigrationJobs(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.exec(ctx, `UPDATE migration_jobs SET status = ?, total_objects = 0, processed_objects = 0, succeeded_objects = 0, failed_objects = 0, current_key = '', finished_at = '', last_error = ?, updated_at = ? WHERE status = ? AND updated_at < ?`, domain.MigrationStatusPending, "recovered after worker interruption", time.Now().UTC().Format(time.RFC3339Nano), domain.MigrationStatusRunning, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, fmt.Errorf("recover stale migration jobs: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) TouchMigrationJob(ctx context.Context, id string) error {
+	res, err := s.exec(ctx, `UPDATE migration_jobs SET updated_at = ? WHERE id = ? AND status = ?`, time.Now().UTC().Format(time.RFC3339Nano), id, domain.MigrationStatusRunning)
+	if err != nil {
+		return fmt.Errorf("touch migration job: %w", err)
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) UpdateMigrationJob(ctx context.Context, job domain.MigrationJob) error {

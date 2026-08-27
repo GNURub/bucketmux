@@ -15,6 +15,7 @@ import (
 
 type Coordinator interface {
 	TryAcquire(ctx context.Context, name string, ttl time.Duration) (Lease, bool, error)
+	Ping(ctx context.Context) error
 }
 
 type Lease interface {
@@ -26,6 +27,8 @@ type NoopCoordinator struct{}
 func (NoopCoordinator) TryAcquire(context.Context, string, time.Duration) (Lease, bool, error) {
 	return noopLease{}, true, nil
 }
+
+func (NoopCoordinator) Ping(context.Context) error { return nil }
 
 type noopLease struct{}
 
@@ -42,6 +45,8 @@ type RedisCoordinator struct {
 	cfg RedisConfig
 }
 
+const releaseLeaseScript = `if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`
+
 func NewRedis(cfg RedisConfig) *RedisCoordinator {
 	if strings.TrimSpace(cfg.KeyPrefix) == "" {
 		cfg.KeyPrefix = "bucketmux"
@@ -53,7 +58,10 @@ func (c *RedisCoordinator) TryAcquire(ctx context.Context, name string, ttl time
 	if ttl <= 0 {
 		ttl = 5 * time.Second
 	}
-	token := randomToken()
+	token, err := randomToken()
+	if err != nil {
+		return nil, false, err
+	}
 	key := c.cfg.KeyPrefix + ":worker:" + name
 	reply, err := c.command(ctx, "SET", key, token, "NX", "PX", strconv.FormatInt(ttl.Milliseconds(), 10))
 	if err != nil {
@@ -65,6 +73,17 @@ func (c *RedisCoordinator) TryAcquire(ctx context.Context, name string, ttl time
 	return redisLease{coordinator: c, key: key, token: token}, true, nil
 }
 
+func (c *RedisCoordinator) Ping(ctx context.Context) error {
+	reply, err := c.command(ctx, "PING")
+	if err != nil {
+		return err
+	}
+	if reply != "+PONG" {
+		return fmt.Errorf("unexpected redis PING response %q", reply)
+	}
+	return nil
+}
+
 type redisLease struct {
 	coordinator *RedisCoordinator
 	key         string
@@ -72,11 +91,7 @@ type redisLease struct {
 }
 
 func (l redisLease) Release(ctx context.Context) error {
-	reply, err := l.coordinator.command(ctx, "GET", l.key)
-	if err != nil || !strings.HasPrefix(reply, "$") || !strings.HasSuffix(reply, "\n"+l.token) {
-		return err
-	}
-	_, err = l.coordinator.command(ctx, "DEL", l.key)
+	_, err := l.coordinator.command(ctx, "EVAL", releaseLeaseScript, "1", l.key, l.token)
 	return err
 }
 
@@ -86,7 +101,7 @@ func (c *RedisCoordinator) command(ctx context.Context, args ...string) (string,
 	if err != nil {
 		return "", err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 	reader := bufio.NewReader(conn)
 	if c.cfg.Password != "" {
@@ -129,8 +144,8 @@ func readRESP(reader *bufio.Reader) (string, error) {
 		return "", err
 	}
 	line = strings.TrimRight(line, "\r\n")
-	if strings.HasPrefix(line, "-") {
-		return "", fmt.Errorf("redis error: %s", strings.TrimPrefix(line, "-"))
+	if after, ok := strings.CutPrefix(line, "-"); ok {
+		return "", fmt.Errorf("redis error: %s", after)
 	}
 	if !strings.HasPrefix(line, "$") {
 		return line, nil
@@ -146,10 +161,10 @@ func readRESP(reader *bufio.Reader) (string, error) {
 	return line + "\n" + string(buf[:size]), nil
 }
 
-func randomToken() string {
+func randomToken() (string, error) {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 10)
+		return "", fmt.Errorf("generate lease token: %w", err)
 	}
-	return hex.EncodeToString(bytes[:])
+	return hex.EncodeToString(bytes[:]), nil
 }

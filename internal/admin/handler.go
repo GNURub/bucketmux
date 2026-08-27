@@ -1,12 +1,14 @@
 package admin
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,20 +22,56 @@ import (
 )
 
 type Handler struct {
-	svc *app.Service
+	svc  *app.Service
+	oidc *oidcAuth
 }
 
-const objectDeleteConfirmationPhrase = "Eliminar permanentemente"
+const objectDeleteConfirmationPhrase = "Delete permanently"
 
-func NewHandler(svc *app.Service) *Handler { return &Handler{svc: svc} }
+func NewHandler(svc *app.Service) *Handler {
+	return &Handler{svc: svc, oidc: newOIDCAuth(svc.Config.Admin.OIDC, svc.Secrets)}
+}
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	path := strings.TrimPrefix(r.URL.Path, "/admin")
+	if h.oidc != nil && h.oidc.enabled() {
+		switch path {
+		case "/login":
+			h.oidc.login(w, r)
+			return
+		case "/oidc/callback":
+			h.oidc.callback(w, r)
+			return
+		case "/logout":
+			h.oidc.logout(w, r)
+			return
+		}
+	}
 	if !h.authorized(r) {
+		if h.oidc != nil && h.oidc.enabled() && strings.Contains(r.Header.Get("Accept"), "text/html") {
+			http.Redirect(w, r, "/admin/login", http.StatusFound)
+			return
+		}
 		w.Header().Set("WWW-Authenticate", `Basic realm="BucketMux admin"`)
 		writeProblem(w, http.StatusUnauthorized, "unauthorized", "Admin credentials are required")
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/admin")
+	if isMutatingMethod(r.Method) && !h.sameOriginRequest(r) {
+		writeProblem(w, http.StatusForbidden, "cross-site-request", "Cross-site admin mutations are forbidden")
+		return
+	}
+	if isMutatingMethod(r.Method) {
+		limit := h.svc.Config.Server.MaxAdminBodyBytes
+		if path == "/upload" {
+			limit = h.svc.Config.Server.MaxUploadBytes + (1 << 20)
+		}
+		if r.ContentLength > limit {
+			writeProblem(w, http.StatusRequestEntityTooLarge, "request-too-large", "Request body exceeds the configured limit")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	}
 	if path == "" || path == "/" {
 		h.index(w, r, "")
 		return
@@ -55,8 +93,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.uploadObjectFromForm(w, r)
 	case path == "/api/providers":
 		h.providers(w, r)
+	case strings.HasPrefix(path, "/api/providers/") && strings.HasSuffix(path, "/test"):
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api/providers/"), "/test")
+		h.testProvider(w, r, id)
+	case strings.HasPrefix(path, "/api/providers/") && strings.HasSuffix(path, "/buckets"):
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api/providers/"), "/buckets")
+		h.discoverProviderBuckets(w, r, id)
 	case strings.HasPrefix(path, "/api/providers/"):
 		h.providerByID(w, r, strings.TrimPrefix(path, "/api/providers/"))
+	case path == "/api/inventory-jobs":
+		h.inventoryJobs(w, r)
+	case path == "/api/repair-jobs":
+		h.repairJobs(w, r)
+	case path == "/api/access-credentials":
+		h.accessCredentials(w, r)
+	case strings.HasPrefix(path, "/api/access-credentials/"):
+		h.accessCredentialByID(w, r, strings.TrimPrefix(path, "/api/access-credentials/"))
+	case path == "/api/trash":
+		h.trash(w, r)
+	case strings.HasPrefix(path, "/api/trash/"):
+		h.trashByID(w, r, strings.TrimPrefix(path, "/api/trash/"))
+	case path == "/api/lifecycle/run":
+		h.runLifecycle(w, r)
+	case path == "/api/placement-plan":
+		h.placementPlan(w, r)
+	case path == "/api/cost-optimizations":
+		h.costOptimizations(w, r)
+	case path == "/api/repair":
+		h.repairObject(w, r)
+	case path == "/api/declarative/apply":
+		h.applyDeclarativeConfig(w, r)
+	case path == "/openapi.json" || path == "/api/openapi.json":
+		h.openapi(w, r)
 	case path == "/api/hooks":
 		h.hooks(w, r)
 	case strings.HasPrefix(path, "/api/hooks/"):
@@ -81,8 +149,52 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) authorized(r *http.Request) bool {
+	if h.oidc != nil && h.oidc.authorized(r) {
+		return true
+	}
+	if h.svc.Config.Admin.Username == "" || h.svc.Config.Admin.Password == "" {
+		return false
+	}
 	user, pass, ok := r.BasicAuth()
-	return ok && user == h.svc.Config.Admin.Username && pass == h.svc.Config.Admin.Password
+	if !ok {
+		return false
+	}
+	userMatch := subtle.ConstantTimeCompare([]byte(user), []byte(h.svc.Config.Admin.Username))
+	passMatch := subtle.ConstantTimeCompare([]byte(pass), []byte(h.svc.Config.Admin.Password))
+	return userMatch&passMatch == 1
+}
+
+func isMutatingMethod(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete
+}
+
+func (h *Handler) sameOriginRequest(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Path != "" {
+		return false
+	}
+	if publicBase := strings.TrimSpace(h.svc.Config.Server.PublicBaseURL); publicBase != "" {
+		expected, err := url.Parse(publicBase)
+		return err == nil && strings.EqualFold(parsed.Scheme, expected.Scheme) && strings.EqualFold(parsed.Host, expected.Host)
+	}
+	host := r.Host
+	if forwardedHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+		host = forwardedHost
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if forwardedProto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwardedProto != "" {
+		scheme = forwardedProto
+	}
+	return strings.EqualFold(parsed.Scheme, scheme) && strings.EqualFold(parsed.Host, host)
 }
 
 func (h *Handler) index(w http.ResponseWriter, r *http.Request, message string) {
@@ -130,13 +242,48 @@ func (h *Handler) index(w http.ResponseWriter, r *http.Request, message string) 
 		writeProblem(w, http.StatusInternalServerError, "store-error", err.Error())
 		return
 	}
+	accessCredentials, err := h.svc.Store.ListAccessCredentials(r.Context())
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "store-error", err.Error())
+		return
+	}
+	for index := range accessCredentials {
+		accessCredentials[index].SecretEncrypted = ""
+	}
+	inventoryJobs, err := h.svc.Store.ListInventoryJobs(r.Context(), 25)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "store-error", err.Error())
+		return
+	}
+	repairJobs, err := h.svc.Store.ListRepairJobs(r.Context(), 25)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "store-error", err.Error())
+		return
+	}
+	trashObjects, err := h.svc.Store.ListTrashObjects(r.Context(), 100)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "store-error", err.Error())
+		return
+	}
+	costOptimizations, _ := h.svc.CostOptimizations(r.Context())
+	providerBrands := make(map[string]string, len(providers))
+	providerNames := make(map[string]string, len(providers))
+	for _, account := range providers {
+		providerBrands[account.ID] = providerBrand(account)
+		providerNames[account.ID] = account.Name
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = indexTemplate.Execute(w, adminPageData{Providers: providers, Buckets: buckets, Usage: usage, Hooks: hooks, HookDeliveries: deliveries, ProviderHealth: health, MigrationJobs: migrations, AuditEvents: auditEvents, TotalBytes: totalUsageBytes(usage), Message: message})
+	_ = indexTemplate.Execute(w, adminPageData{Providers: providers, ProviderBrands: providerBrands, ProviderNames: providerNames, Buckets: buckets, Usage: usage, Hooks: hooks, HookDeliveries: deliveries, ProviderHealth: health, MigrationJobs: migrations, AuditEvents: auditEvents, AccessCredentials: accessCredentials, InventoryJobs: inventoryJobs, RepairJobs: repairJobs, TrashObjects: trashObjects, CostOptimizations: costOptimizations, OIDCEnabled: h.svc.Config.Admin.OIDC.Enabled, TotalBytes: totalUsageBytes(usage), Message: message})
 }
 
 func (h *Handler) uploadObjectFromForm(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		h.uploadFormError(w, r, http.StatusBadRequest, "invalid-upload-form", "Invalid upload form: "+err.Error())
+		status := http.StatusBadRequest
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		h.uploadFormError(w, r, status, "invalid-upload-form", "Invalid upload form: "+err.Error())
 		return
 	}
 	bucket := strings.TrimSpace(r.FormValue("bucket"))
@@ -146,7 +293,7 @@ func (h *Handler) uploadObjectFromForm(w http.ResponseWriter, r *http.Request) {
 		h.uploadFormError(w, r, http.StatusBadRequest, "missing-file", "File is required: "+err.Error())
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if bucket == "" {
 		h.uploadFormError(w, r, http.StatusBadRequest, "missing-bucket", "Bucket is required")
 		return
@@ -295,7 +442,16 @@ func (h *Handler) createBucketFromForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	replicationProviderIDs := normalizeProviderIDs(r.Form["replication_provider_ids"])
-	bucket := domain.Bucket{Name: strings.TrimSpace(r.FormValue("name")), ReplicationEnabled: len(replicationProviderIDs) > 0, ReplicationProviderIDs: replicationProviderIDs}
+	trashRetentionDays, _ := strconv.Atoi(defaultString(r.FormValue("trash_retention_days"), "30"))
+	defaultRetentionDays, _ := strconv.Atoi(r.FormValue("default_retention_days"))
+	expireAfterDays, _ := strconv.Atoi(r.FormValue("lifecycle_expire_days"))
+	bucket := domain.Bucket{Name: strings.TrimSpace(r.FormValue("name")), ReplicationEnabled: len(replicationProviderIDs) > 0, ReplicationProviderIDs: replicationProviderIDs, VersioningEnabled: r.FormValue("versioning_enabled") == "on", TrashEnabled: r.FormValue("trash_enabled") == "on", TrashRetentionDays: trashRetentionDays, ObjectLockEnabled: r.FormValue("object_lock_enabled") == "on", DefaultRetentionMode: strings.ToUpper(r.FormValue("default_retention_mode")), DefaultRetentionDays: defaultRetentionDays}
+	if expireAfterDays > 0 {
+		bucket.LifecycleRules = []domain.LifecycleRule{{ID: "default-expiration", Prefix: strings.TrimLeft(r.FormValue("lifecycle_prefix"), "/"), ExpireAfterDays: expireAfterDays, Enabled: true}}
+	}
+	if bucket.ObjectLockEnabled {
+		bucket.VersioningEnabled = true
+	}
 	if bucket.Name == "" {
 		h.index(w, r, "Bucket name is required")
 		return
@@ -352,6 +508,311 @@ func (h *Handler) providerByID(w http.ResponseWriter, r *http.Request, id string
 	}
 	h.svc.RecordAuditEvent(r.Context(), domain.AuditEvent{Actor: app.AuditActorFromRequest(r), Action: domain.AuditActionProviderDeleted, TargetID: id})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) testProvider(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	health, err := h.svc.TestProviderConnection(r.Context(), id)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "provider-test-failed", err.Error())
+		return
+	}
+	status := http.StatusOK
+	if health.Status == domain.ProviderHealthUnhealthy {
+		status = http.StatusBadGateway
+	}
+	writeJSON(w, status, health)
+}
+
+func (h *Handler) discoverProviderBuckets(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	buckets, err := h.svc.DiscoverProviderBuckets(r.Context(), id)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "bucket-discovery-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"provider_account_id": id, "buckets": buckets})
+}
+
+func (h *Handler) inventoryJobs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		jobs, err := h.svc.Store.ListInventoryJobs(r.Context(), 50)
+		if err != nil {
+			writeProblem(w, http.StatusInternalServerError, "inventory-list-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, jobs)
+	case http.MethodPost:
+		var req struct {
+			ProviderAccountID string `json:"provider_account_id"`
+			Bucket            string `json:"bucket"`
+			RemoteBucket      string `json:"remote_bucket"`
+			Prefix            string `json:"prefix"`
+			Mode              string `json:"mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid-json", err.Error())
+			return
+		}
+		job, err := h.svc.CreateInventoryJob(r.Context(), app.CreateInventoryJobInput{ProviderAccountID: req.ProviderAccountID, Bucket: req.Bucket, RemoteBucket: req.RemoteBucket, Prefix: req.Prefix, Mode: req.Mode})
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "inventory-create-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, job)
+	default:
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+	}
+}
+
+func (h *Handler) repairJobs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		jobs, err := h.svc.Store.ListRepairJobs(r.Context(), 50)
+		if err != nil {
+			writeProblem(w, http.StatusInternalServerError, "repair-list-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, jobs)
+	case http.MethodPost:
+		var request struct {
+			Bucket string `json:"bucket"`
+			Prefix string `json:"prefix"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid-json", err.Error())
+			return
+		}
+		job, err := h.svc.CreateRepairJob(r.Context(), request.Bucket, request.Prefix)
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "repair-create-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, job)
+	default:
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+	}
+}
+
+type accessCredentialRequest struct {
+	Name           string   `json:"name"`
+	Role           string   `json:"role"`
+	Permissions    []string `json:"permissions"`
+	BucketPatterns []string `json:"bucket_patterns"`
+	PrefixPatterns []string `json:"prefix_patterns"`
+	Enabled        bool     `json:"enabled"`
+	ExpiresAt      string   `json:"expires_at"`
+}
+
+func (request accessCredentialRequest) toAppInput() (app.AccessCredentialInput, error) {
+	var expiresAt time.Time
+	var err error
+	if strings.TrimSpace(request.ExpiresAt) != "" {
+		expiresAt, err = time.Parse(time.RFC3339, request.ExpiresAt)
+		if err != nil {
+			return app.AccessCredentialInput{}, fmt.Errorf("expires_at must be RFC3339: %w", err)
+		}
+	}
+	return app.AccessCredentialInput{Name: request.Name, Role: request.Role, Permissions: request.Permissions, BucketPatterns: request.BucketPatterns, PrefixPatterns: request.PrefixPatterns, Enabled: request.Enabled, ExpiresAt: expiresAt}, nil
+}
+
+func (h *Handler) accessCredentials(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		credentials, err := h.svc.Store.ListAccessCredentials(r.Context())
+		if err != nil {
+			writeProblem(w, http.StatusInternalServerError, "credential-list-failed", err.Error())
+			return
+		}
+		for index := range credentials {
+			credentials[index].SecretEncrypted = ""
+		}
+		writeJSON(w, http.StatusOK, credentials)
+	case http.MethodPost:
+		var request accessCredentialRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid-json", err.Error())
+			return
+		}
+		input, err := request.toAppInput()
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid-credential", err.Error())
+			return
+		}
+		created, err := h.svc.CreateAccessCredential(r.Context(), input)
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "credential-create-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+	}
+}
+
+func (h *Handler) accessCredentialByID(w http.ResponseWriter, r *http.Request, path string) {
+	id := strings.TrimSuffix(path, "/")
+	if strings.HasSuffix(id, "/rotate") {
+		id = strings.TrimSuffix(id, "/rotate")
+		if r.Method != http.MethodPost {
+			writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+			return
+		}
+		rotated, err := h.svc.RotateAccessCredential(r.Context(), id)
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "credential-rotate-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, rotated)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var request accessCredentialRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid-json", err.Error())
+			return
+		}
+		input, err := request.toAppInput()
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "invalid-credential", err.Error())
+			return
+		}
+		credential, err := h.svc.UpdateAccessCredential(r.Context(), id, input)
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "credential-update-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, credential)
+	case http.MethodDelete:
+		if err := h.svc.Store.DeleteAccessCredential(r.Context(), id); err != nil {
+			writeProblem(w, http.StatusInternalServerError, "credential-delete-failed", err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+	}
+}
+
+func (h *Handler) trash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	objects, err := h.svc.Store.ListTrashObjects(r.Context(), 200)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "trash-list-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, objects)
+}
+
+func (h *Handler) trashByID(w http.ResponseWriter, r *http.Request, path string) {
+	id := strings.TrimSuffix(path, "/")
+	if strings.HasSuffix(id, "/restore") {
+		id = strings.TrimSuffix(id, "/restore")
+		if r.Method != http.MethodPost {
+			writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+			return
+		}
+		object, err := h.svc.RestoreTrashObject(r.Context(), id)
+		if err != nil {
+			writeProblem(w, http.StatusBadRequest, "trash-restore-failed", err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, objectResponseFromDomain(object))
+		return
+	}
+	if r.Method != http.MethodDelete {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	if r.URL.Query().Get("confirm") != "Purge permanently" {
+		writeProblem(w, http.StatusBadRequest, "invalid-confirmation", `confirmation must exactly match "Purge permanently"`)
+		return
+	}
+	if err := h.svc.PurgeTrashObject(r.Context(), id); err != nil {
+		writeProblem(w, http.StatusBadRequest, "trash-purge-failed", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) runLifecycle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	result, err := h.svc.RunLifecycleOnce(r.Context(), time.Now().UTC())
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "lifecycle-run-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) placementPlan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	size, err := strconv.ParseInt(defaultString(r.URL.Query().Get("size"), "0"), 10, 64)
+	if err != nil || size < 0 {
+		writeProblem(w, http.StatusBadRequest, "invalid-size", "size must be a non-negative integer")
+		return
+	}
+	plan, err := h.svc.PlanPlacement(r.Context(), r.URL.Query().Get("bucket"), size)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "placement-plan-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, plan)
+}
+
+func (h *Handler) costOptimizations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	optimizations, err := h.svc.CostOptimizations(r.Context())
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "cost-analysis-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, optimizations)
+}
+
+func (h *Handler) repairObject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	var request struct {
+		Bucket string `json:"bucket"`
+		Key    string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeProblem(w, http.StatusBadRequest, "invalid-json", err.Error())
+		return
+	}
+	if request.Bucket == "" || request.Key == "" {
+		writeProblem(w, http.StatusBadRequest, "missing-object", "bucket and key are required")
+		return
+	}
+	result, err := h.svc.RepairObject(r.Context(), request.Bucket, request.Key)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "repair-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) hooks(w http.ResponseWriter, r *http.Request) {
@@ -529,7 +990,7 @@ func (h *Handler) deleteAdminObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Confirm != objectDeleteConfirmationPhrase {
-		writeProblem(w, http.StatusBadRequest, "invalid-confirmation", `confirmation must exactly match "Eliminar permanentemente"`)
+		writeProblem(w, http.StatusBadRequest, "invalid-confirmation", fmt.Sprintf("confirmation must exactly match %q", objectDeleteConfirmationPhrase))
 		return
 	}
 	if req.Bucket == "" || req.Key == "" {
@@ -773,16 +1234,105 @@ func objectResponseFromDomain(obj domain.ObjectRecord) objectResponse {
 }
 
 type adminPageData struct {
-	Providers      []domain.ProviderAccount
-	Buckets        []domain.Bucket
-	Usage          []domain.ProviderBucketUsage
-	Hooks          []domain.Hook
-	HookDeliveries []domain.HookDelivery
-	ProviderHealth []domain.ProviderHealth
-	MigrationJobs  []domain.MigrationJob
-	AuditEvents    []domain.AuditEvent
-	TotalBytes     int64
-	Message        string
+	Providers         []domain.ProviderAccount
+	ProviderBrands    map[string]string
+	ProviderNames     map[string]string
+	Buckets           []domain.Bucket
+	Usage             []domain.ProviderBucketUsage
+	Hooks             []domain.Hook
+	HookDeliveries    []domain.HookDelivery
+	ProviderHealth    []domain.ProviderHealth
+	MigrationJobs     []domain.MigrationJob
+	AuditEvents       []domain.AuditEvent
+	AccessCredentials []domain.AccessCredential
+	InventoryJobs     []domain.InventoryJob
+	RepairJobs        []domain.RepairJob
+	TrashObjects      []domain.TrashRecord
+	CostOptimizations []app.CostOptimization
+	OIDCEnabled       bool
+	TotalBytes        int64
+	Message           string
+}
+
+func providerBrand(account domain.ProviderAccount) string {
+	switch account.Kind {
+	case domain.ProviderKindLocal:
+		return "local"
+	case domain.ProviderKindCloudinary:
+		return "cloudinary"
+	case domain.ProviderKindVercelBlob:
+		return "vercel"
+	case domain.ProviderKindS3Compat:
+		endpoint := strings.ToLower(account.Endpoint)
+		switch {
+		case strings.Contains(endpoint, "amazonaws.com"):
+			return "aws"
+		case strings.Contains(endpoint, "cloudflarestorage.com"):
+			return "cloudflare"
+		case strings.Contains(endpoint, "storage.googleapis.com"):
+			return "gcs"
+		case strings.Contains(endpoint, "backblazeb2.com"):
+			return "backblaze"
+		case strings.Contains(endpoint, "digitaloceanspaces.com"):
+			return "digitalocean"
+		case strings.Contains(endpoint, "wasabisys.com"):
+			return "wasabi"
+		case strings.Contains(endpoint, "minio"):
+			return "minio"
+		default:
+			return "custom"
+		}
+	default:
+		return "custom"
+	}
+}
+
+func providerBrandMark(brand string) string {
+	switch brand {
+	case "aws":
+		return "aws"
+	case "cloudflare":
+		return "R2"
+	case "gcs":
+		return "G"
+	case "backblaze":
+		return "B2"
+	case "digitalocean":
+		return "DO"
+	case "wasabi":
+		return "W"
+	case "minio":
+		return "M"
+	case "cloudinary":
+		return "C"
+	case "vercel":
+		return "▲"
+	case "local":
+		return "LD"
+	default:
+		return "S3"
+	}
+}
+
+const theSVGRevision = "7870bc1c5f657d9accbb7f96cc457b8dd3363ee8"
+
+func providerIconURL(brand string) string {
+	icons := map[string]string{
+		"aws":          "aws/color.svg",
+		"cloudflare":   "cloudflare/color.svg",
+		"gcs":          "google-cloud/default.svg",
+		"backblaze":    "backblaze/default.svg",
+		"digitalocean": "digitalocean/default.svg",
+		"wasabi":       "wasabi/default.svg",
+		"minio":        "minio/default.svg",
+		"cloudinary":   "cloudinary/default.svg",
+		"vercel":       "vercel/mono.svg",
+	}
+	path := icons[brand]
+	if path == "" {
+		return ""
+	}
+	return "https://cdn.jsdelivr.net/gh/glincker/thesvg@" + theSVGRevision + "/public/icons/" + path
 }
 
 func totalUsageBytes(rows []domain.ProviderBucketUsage) int64 {
@@ -933,17 +1483,12 @@ func normalizeProviderIDs(values []string) []string {
 }
 
 func containsString(values []string, needle string) bool {
-	for _, value := range values {
-		if value == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, needle)
 }
 
 func parseHookHeaderLines(raw string) map[string]string {
 	headers := map[string]string{}
-	for _, line := range strings.Split(raw, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -973,15 +1518,20 @@ func wantsJSON(r *http.Request) bool {
 }
 
 var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
-	"formatBytes": formatBytes,
-	"join":        joinStrings,
-	"progressPct": migrationProgressPercent,
-}).Parse(`<!doctype html>
+	"formatBytes":       formatBytes,
+	"join":              joinStrings,
+	"progressPct":       migrationProgressPercent,
+	"providerBrand":     providerBrand,
+	"providerBrandMark": providerBrandMark,
+	"providerIconURL":   providerIconURL,
+}).Parse(`{{define "providerIcon"}}<span class="provider-icon provider-icon-{{.}}" aria-hidden="true"><span class="provider-icon-fallback">{{providerBrandMark .}}</span>{{with providerIconURL .}}<img src="{{.}}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true">{{end}}</span>{{end}}
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BucketMux admin</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23171717'/%3E%3Cpath d='M10 8h7.5c4 0 6 1.6 6 4.3 0 1.8-.9 3.1-2.7 3.7 2.1.6 3.2 1.9 3.2 3.9 0 2.8-2.2 4.6-6.2 4.6H10V8Zm6.9 6.5c1.7 0 2.5-.6 2.5-1.8 0-1.1-.8-1.7-2.5-1.7h-2.8v3.5h2.8Zm.4 6.9c1.8 0 2.7-.7 2.7-2s-.9-1.9-2.7-1.9h-3.2v3.9h3.2Z' fill='white'/%3E%3C/svg%3E" />
   <style>
     :root{
       color-scheme:dark;
@@ -1042,51 +1592,142 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
     .admin-dialog{width:min(720px,calc(100vw - 28px));max-height:calc(100vh - 40px);border:1px solid var(--line);border-radius:20px;background:linear-gradient(180deg,#111,#080808);color:var(--text);box-shadow:var(--shadow);padding:0;overflow:hidden}.admin-dialog::backdrop{background:rgba(0,0,0,.72);backdrop-filter:blur(8px)}.dialog-header{padding:18px 20px;border-bottom:1px solid var(--line-soft);display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.dialog-body{padding:20px;overflow:auto;max-height:calc(100vh - 152px)}.dialog-close{appearance:none;border:1px solid var(--line);background:#050505;color:#fff;border-radius:10px;width:34px;height:34px;cursor:pointer;font-size:20px;line-height:1}.dialog-close:hover{background:#18181b}
     @media (max-width:900px){.grid,.stats,.browser-toolbar{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.hero h2{font-size:28px}.topbar{align-items:flex-start;flex-direction:column}}
   </style>
+  <style>
+    /* Product dashboard redesign: intentionally self-contained for the embedded admin. */
+    :root{
+      color-scheme:light;
+      --bg:#fff;
+      --panel:#fff;
+      --panel-2:#fafafa;
+      --line:#eaeaea;
+      --line-soft:#f0f0f0;
+      --text:#171717;
+      --muted:#666;
+      --muted-2:#8f8f8f;
+      --accent:#171717;
+      --accent-text:#fff;
+      --danger:#dc2626;
+      --success:#16a34a;
+      --warning:#d97706;
+      --radius:8px;
+      --shadow:0 12px 32px rgba(0,0,0,.12),0 2px 8px rgba(0,0,0,.06);
+      --sidebar-width:232px;
+    }
+    html[data-theme="dark"]{
+      color-scheme:dark;
+      --bg:#0a0a0a;
+      --panel:#0a0a0a;
+      --panel-2:#111;
+      --line:#292929;
+      --line-soft:#1f1f1f;
+      --text:#ededed;
+      --muted:#a1a1a1;
+      --muted-2:#777;
+      --accent:#ededed;
+      --accent-text:#0a0a0a;
+      --danger:#f87171;
+      --success:#4ade80;
+      --warning:#fbbf24;
+      --shadow:0 16px 44px rgba(0,0,0,.52),0 0 0 1px rgba(255,255,255,.08);
+    }
+    html{scroll-behavior:smooth;background:var(--bg)}
+    body{background:var(--bg);color:var(--text);font-family:Geist,Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:-.006em}
+    button,input,select,textarea{font:inherit}
+    .app-shell{min-height:100vh;display:grid;grid-template-columns:var(--sidebar-width) minmax(0,1fr)}
+    .sidebar{position:fixed;inset:0 auto 0 0;width:var(--sidebar-width);display:flex;flex-direction:column;border-right:1px solid var(--line);background:var(--panel);z-index:30}
+    .sidebar-brand{height:64px;padding:0 20px;display:flex;align-items:center;border-bottom:1px solid var(--line)}
+    .brand{gap:10px}.logo{width:28px;height:28px;border-radius:6px;background:var(--text);color:var(--bg);box-shadow:none;font-size:13px}.brand h1{font-size:15px;font-weight:650}.brand p{display:none}
+    .sidebar-nav{display:grid;gap:2px;padding:16px 10px}.nav-link{display:flex;align-items:center;gap:10px;min-height:38px;padding:8px 10px;border-radius:6px;color:var(--muted);font-size:13px;font-weight:500;text-decoration:none;transition:background .14s,color .14s}.nav-link:hover,.nav-link.active{background:var(--panel-2);color:var(--text)}.nav-link svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.75;flex:none}
+    .sidebar-footer{margin-top:auto;padding:16px 20px;border-top:1px solid var(--line)}.sidebar-footer .status{padding:0;border:0;background:none;backdrop-filter:none;border-radius:0;font-size:12px;color:var(--muted)}.sidebar-meta{margin:10px 0 0;color:var(--muted-2);font-size:11px}.dot{width:7px;height:7px;box-shadow:none}
+    .workspace{grid-column:2;min-width:0}.topbar{position:sticky;top:0;z-index:20;height:64px;margin:0;padding:0 28px;display:flex;flex-direction:row;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(16px)}
+    .topbar-left,.topbar-actions{display:flex;align-items:center;gap:10px}.icon-btn{appearance:none;width:34px;height:34px;display:grid;place-items:center;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text);cursor:pointer}.icon-btn.mobile-menu{display:none}.icon-btn:hover{background:var(--panel-2)}.icon-btn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.75}
+    .dashboard-search{position:relative;width:min(420px,38vw)}.dashboard-search svg{position:absolute;left:11px;top:50%;width:15px;height:15px;transform:translateY(-50%);stroke:var(--muted-2);fill:none;stroke-width:1.8}.dashboard-search input{height:36px;padding:8px 36px;border-radius:6px;background:var(--panel);font-size:13px}.search-shortcut{position:absolute;right:8px;top:7px;border:1px solid var(--line);border-radius:4px;padding:2px 6px;color:var(--muted-2);font-size:11px;background:var(--panel-2)}
+    .topbar-status{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px}.topbar-status .dot{background:var(--success)}
+    .shell{max-width:1480px;margin:0 auto;padding:34px 32px 64px}.hero{border:0;border-radius:0;padding:0;background:none;box-shadow:none;margin:0 0 24px}.page-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}.eyebrow{display:block;margin-bottom:7px;color:var(--muted);font-size:12px;font-weight:550}.hero h2{margin:0;font-size:30px;line-height:1.15;letter-spacing:-.045em;font-weight:650}.hero p{margin:7px 0 0;max-width:680px;color:var(--muted);font-size:14px;line-height:1.6}.hero-actions{justify-content:flex-end;margin:0}.stats{grid-template-columns:repeat(4,minmax(0,1fr));gap:0;margin-top:28px;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}.stat{position:relative;min-height:112px;padding:20px;border:0;border-right:1px solid var(--line);border-radius:0;background:var(--panel)}.stat:last-child{border-right:0}.stat strong{font-size:25px;font-weight:600;letter-spacing:-.04em}.stat span{display:block;margin-bottom:14px;color:var(--muted);font-size:12px;text-transform:none;letter-spacing:0}.stat small{display:block;margin-top:8px;color:var(--muted-2);font-size:11px}
+    .grid{grid-template-columns:minmax(0,1fr) 268px;gap:20px}.stack{gap:20px}.card{scroll-margin-top:84px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);box-shadow:none}.card[hidden]{display:none}.card-header{min-height:66px;padding:16px 18px;border-bottom:1px solid var(--line);align-items:center}.card-title{font-size:14px;font-weight:600}.card-desc{margin-top:4px;color:var(--muted);font-size:12px}.card-body{padding:18px}.card-header-actions{align-items:center}
+    .provider-identity{display:flex;align-items:center;gap:10px;min-width:150px}.provider-identity-copy{display:grid;min-width:0}.provider-icon{position:relative;display:inline-grid;place-items:center;flex:0 0 auto;width:30px;height:30px;overflow:hidden;border:1px solid var(--line);border-radius:7px;background:#fff;color:#171717;font-size:9px;font-weight:750;letter-spacing:-.04em}.provider-icon img{position:absolute;inset:5px;width:calc(100% - 10px);height:calc(100% - 10px);object-fit:contain}.provider-icon-fallback{line-height:1}.provider-icon-custom{background:#171717;color:#fff}.provider-icon-local{background:var(--panel-2);color:var(--text)}.provider-icon-vercel{background:#fff}.provider-icon-cloudflare img,.provider-icon-cloudinary img,.provider-icon-gcs img{inset:4px;width:calc(100% - 8px);height:calc(100% - 8px)}
+    .provider-catalog-intro{margin-bottom:16px;color:var(--muted);font-size:12px;line-height:1.55}.provider-catalog{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.provider-preset{appearance:none;display:flex;align-items:center;gap:12px;min-height:66px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);text-align:left;cursor:pointer;transition:border-color .14s,background .14s}.provider-preset:hover{border-color:color-mix(in srgb,var(--text) 42%,var(--line));background:var(--panel-2)}.provider-preset:focus-visible{outline:2px solid var(--text);outline-offset:2px}.provider-preset .provider-icon{width:38px;height:38px}.provider-preset-copy{display:grid;gap:3px}.provider-preset-copy strong{font-size:13px;font-weight:600}.provider-preset-copy span{color:var(--muted);font-size:11px;line-height:1.35}.provider-config-summary{display:flex;align-items:center;gap:12px;margin-bottom:18px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2)}.provider-config-summary .provider-icon{width:40px;height:40px}.provider-config-title{display:grid;gap:2px}.provider-config-title strong{font-size:13px}.provider-config-title span{color:var(--muted);font-size:11px}.provider-back{margin-left:auto}.provider-fields-title{margin:20px 0 10px;color:var(--muted);font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.06em}.provider-advanced{margin-top:16px;border:1px solid var(--line);border-radius:7px;background:var(--panel)}.provider-advanced summary{padding:12px;cursor:pointer;color:var(--muted);font-size:12px;font-weight:550}.provider-advanced[open] summary{border-bottom:1px solid var(--line);color:var(--text)}.provider-advanced-body{padding:14px}.provider-icon-credit{margin:14px 0 0;color:var(--muted-2);font-size:10px}.provider-icon-credit a{color:inherit}.provider-field[hidden]{display:none}
+    .notice{border-color:#f5d08a;background:#fffaf0;color:#92400e;border-radius:6px}.notice.success{border-color:#b7e4c7;background:#f0fdf4;color:#166534}.notice.error{border-color:#fecaca;background:#fef2f2;color:#991b1b}html[data-theme="dark"] .notice{background:#241a08;color:#fcd34d}html[data-theme="dark"] .notice.success{background:#082013;color:#86efac}html[data-theme="dark"] .notice.error{background:#290d0d;color:#fca5a5}
+    label{color:var(--text);font-weight:500}.hint{color:var(--muted)}input,select,textarea{border-color:var(--line);border-radius:6px;background:var(--panel);color:var(--text);padding:10px 11px;box-shadow:0 1px 2px rgba(0,0,0,.03)}input:focus,select:focus,textarea:focus{border-color:var(--text);background:var(--panel);box-shadow:0 0 0 2px color-mix(in srgb,var(--text) 12%,transparent)}input::placeholder,textarea::placeholder{color:var(--muted-2)}
+    .btn{min-height:34px;border-color:var(--accent);border-radius:6px;background:var(--accent);color:var(--accent-text);padding:8px 12px;font-weight:550;font-size:12px;box-shadow:0 1px 2px rgba(0,0,0,.08);transition:background .12s,border-color .12s,opacity .12s}.btn:hover{transform:none;opacity:.84;background:var(--accent)}.btn.secondary{background:var(--panel);color:var(--text);border-color:var(--line)}.btn.secondary:hover{background:var(--panel-2)}.btn.danger{background:var(--panel);border-color:#fecaca;color:var(--danger)}.btn.danger:hover{background:#fef2f2}html[data-theme="dark"] .btn.danger:hover{background:#290d0d}.btn.compact{min-height:30px;padding:6px 9px}
+    .table-wrap{margin:0 -18px -18px}.table th{height:36px;padding:0 14px;background:var(--panel-2);color:var(--muted);font-size:11px;text-transform:none;letter-spacing:0;font-weight:500;white-space:nowrap}.table td{padding:12px 14px;border-top:1px solid var(--line);font-size:12px}.table tr:hover td{background:var(--panel-2)}.table th:first-child,.table td:first-child{padding-left:18px}.table th:last-child,.table td:last-child{padding-right:18px}.name{font-weight:550}.sub{color:var(--muted);font-size:11px}.mono{color:var(--text);font-size:11px}.pill{border:0;background:transparent;border-radius:0;padding:0;color:var(--muted);font-size:11px}.pill:before{width:7px;height:7px}.empty{border-color:var(--line);border-radius:6px;background:var(--panel-2);font-size:12px}
+    .browser-toolbar{grid-template-columns:minmax(150px,.65fr) minmax(220px,1.35fr) minmax(140px,.55fr)}.folder-btn{border-color:var(--line);border-radius:6px;background:var(--panel);color:var(--text)}.folder-btn:hover{background:var(--panel-2)}.progress{height:6px;border:0;background:var(--line)}.progress span{background:var(--success)}.code{background:var(--panel-2);border-color:var(--line);border-radius:6px;color:var(--text)}
+    .admin-dialog{width:min(680px,calc(100vw - 28px));border-color:var(--line);border-radius:10px;background:var(--panel);color:var(--text);box-shadow:var(--shadow)}.admin-dialog::backdrop{background:rgba(0,0,0,.48);backdrop-filter:blur(2px)}.dialog-header{padding:18px 20px;border-color:var(--line)}.dialog-body{padding:20px}.dialog-close{border-color:var(--line);background:var(--panel);color:var(--text);border-radius:6px}.dialog-close:hover{background:var(--panel-2)}.footer{padding-top:20px;border-top:1px solid var(--line);text-align:left}
+    .search-empty{margin-bottom:20px}.filtered-out{display:none!important}
+    @media (max-width:1100px){.grid{grid-template-columns:1fr}.grid>aside{grid-row:1}.grid>aside .stack,.grid>aside.stack{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.stat:nth-child(2){border-right:0}.stat:nth-child(-n+2){border-bottom:1px solid var(--line)}}
+    @media (max-width:760px){.app-shell{display:block}.workspace{grid-column:auto}.sidebar{transform:translateX(-100%);transition:transform .18s ease;box-shadow:var(--shadow)}.sidebar.open{transform:translateX(0)}.topbar{height:58px;padding:0 16px}.icon-btn.mobile-menu{display:grid}.dashboard-search{width:min(100%,320px)}.search-shortcut,.topbar-status{display:none}.shell{padding:24px 16px 48px}.page-heading{display:grid}.hero-actions{justify-content:flex-start}.stats{grid-template-columns:1fr}.stat{border-right:0;border-bottom:1px solid var(--line)}.stat:last-child{border-bottom:0}.grid>aside .stack,.grid>aside.stack{grid-template-columns:1fr}.form-grid,.browser-toolbar,.provider-catalog{grid-template-columns:1fr}.card-header{align-items:flex-start}.table-wrap{overflow-x:auto}.hero h2{font-size:25px}}
+  </style>
 </head>
 <body>
-  <main class="shell">
+  <div class="app-shell">
+    <aside id="admin-sidebar" class="sidebar" aria-label="Admin navigation">
+      <div class="sidebar-brand"><div class="brand"><div class="logo">B</div><div><h1>BucketMux</h1><p>Storage gateway</p></div></div></div>
+      <nav class="sidebar-nav">
+        <a class="nav-link active" href="#overview"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-3H4zM14 7h6V4h-6z"/></svg>Overview</a>
+        <a class="nav-link" href="#object-browser-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5h18v12H3zM3 7.5l3-3h5l2 3"/></svg>Objects</a>
+        <a class="nav-link" href="#providers-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8.5a7 7 0 0 1 13.3 2.7A4.5 4.5 0 0 1 18 20H6a4 4 0 0 1-1-7.9"/></svg>Providers</a>
+        <a class="nav-link" href="#buckets-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16l-1.5 11h-13zM7 8V5h10v3"/></svg>Buckets</a>
+        <a class="nav-link" href="#migration-jobs-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h13m0 0-3-3m3 3-3 3M19 17H6m0 0 3-3m-3 3 3 3"/></svg>Migrations</a>
+        <a class="nav-link" href="#inventory-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v12H4zM8 10h8M8 14h5"/></svg>Inventory</a>
+        <a class="nav-link" href="#repair-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v4m0 10v4M3 12h4m10 0h4M7 7l3 3m4 4 3 3M17 7l-3 3m-4 4-3 3"/></svg>Repair</a>
+        <a class="nav-link" href="#security-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-2.8 8-7 10-4.2-2-7-5.5-7-10V6z"/></svg>Access</a>
+        <a class="nav-link" href="#protection-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v10H5z"/></svg>Protection</a>
+        <a class="nav-link" href="#cost-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M17 7.5c0-2-2-3-5-3s-5 1-5 3 2 3 5 3 5 1 5 3-2 3-5 3-5-1-5-3"/></svg>Costs</a>
+        <a class="nav-link" href="#hooks-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V4m8 3V4M6 7h12v5a6 6 0 0 1-12 0zM12 18v3"/></svg>Hooks</a>
+        <a class="nav-link" href="#audit-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-2.8 8-7 10-4.2-2-7-5.5-7-10V6z"/></svg>Audit log</a>
+      </nav>
+      <div class="sidebar-footer"><div class="status"><span class="dot"></span> Admin operational</div><p class="sidebar-meta">Core S3 control plane</p></div>
+    </aside>
+    <div class="workspace">
     <header class="topbar">
-      <div class="brand"><div class="logo">B</div><div><h1>BucketMux</h1><p>Self-hosted S3-compatible storage gateway</p></div></div>
-      <div class="status"><span class="dot"></span> Admin enabled</div>
+      <div class="topbar-left">
+        <button id="sidebar-toggle" class="icon-btn mobile-menu" type="button" aria-label="Open navigation" aria-controls="admin-sidebar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+        <label class="dashboard-search" aria-label="Filter dashboard"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/></svg><input id="dashboard-search" type="search" placeholder="Filter dashboard…" autocomplete="off"><span class="search-shortcut">/</span></label>
+      </div>
+      <div class="topbar-actions"><div class="topbar-status"><span class="dot"></span>Operational</div><button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle color theme"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5z"/></svg></button></div>
     </header>
+    <main class="shell">
 
-    <section class="hero">
-      <h2>Storage routing, without vendor lock-in.</h2>
-      <p>Configura proveedores gratuitos, cuentas locales o S3-compatible, y deja que el gateway enrute subidas desde una API compatible con S3.</p>
-      <div class="hero-actions">
-        <button class="btn" type="button" data-open-dialog="provider-dialog">New provider</button>
-        <button class="btn secondary" type="button" data-open-dialog="bucket-dialog">New bucket</button>
-        <button class="btn secondary" type="button" data-open-dialog="upload-dialog">Upload object</button>
-        <button class="btn secondary" type="button" data-browse-objects>Browse objects</button>
-        <button class="btn secondary" type="button" data-open-dialog="migration-dialog">Migrate</button>
-        <button class="btn secondary" type="button" data-open-dialog="hook-dialog">New hook</button>
+    <section id="overview" class="hero">
+      <div class="page-heading">
+        <div><span class="eyebrow">Storage</span><h2>Storage overview</h2><p>Manage routing, providers, replicas, and object operations from one control plane.</p></div>
+        <div class="hero-actions">
+          <button class="btn secondary" type="button" data-open-dialog="upload-dialog">Upload object</button>
+          <button class="btn secondary" type="button" data-open-dialog="provider-dialog">Add provider</button>
+          <button class="btn secondary" type="button" data-open-dialog="bucket-dialog">Add bucket</button>
+          <button class="btn" type="button" data-open-dialog="migration-dialog">Start migration</button>
+        </div>
       </div>
       <div class="stats">
-        <div class="stat"><strong>{{len .Providers}}</strong><span>Providers</span></div>
-        <div class="stat"><strong>{{len .Buckets}}</strong><span>Logical buckets</span></div>
-        <div class="stat"><strong>{{formatBytes .TotalBytes}}</strong><span>Indexed storage</span></div>
+        <div class="stat"><span>Total usage</span><strong>{{formatBytes .TotalBytes}}</strong><small>Indexed object storage</small></div>
+        <div class="stat"><span>Providers</span><strong>{{len .Providers}}</strong><small>Configured backends</small></div>
+        <div class="stat"><span>Buckets</span><strong>{{len .Buckets}}</strong><small>Logical S3 buckets</small></div>
+        <div class="stat"><span>Migrations</span><strong>{{len .MigrationJobs}}</strong><small>Recent background jobs</small></div>
       </div>
     </section>
+
+    <div id="dashboard-search-empty" class="empty search-empty" hidden>No dashboard sections match this filter.</div>
 
     {{if .Message}}<div class="notice">{{.Message}}</div>{{end}}
 
     <div class="grid">
       <div class="stack">
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Providers</h2><p class="card-desc">Credenciales cifradas. Los secretos existentes no se muestran nunca.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="provider-dialog">New provider</button></div></div>
+        <section id="providers-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Providers</h2><p class="card-desc">Encrypted credentials. Existing secrets are never displayed.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="provider-dialog">New provider</button></div></div>
           <div class="card-body table-wrap">
             {{if .Providers}}
             <table class="table">
               <thead><tr><th>Provider</th><th>Type</th><th>Target</th><th>Usage</th><th>Status</th><th></th></tr></thead>
               <tbody>
               {{range .Providers}}
+                {{$brand := providerBrand .}}
                 <tr>
-                  <td><span class="name">{{.ID}}</span><span class="sub">{{.Name}}</span></td>
+                  <td><span class="provider-identity">{{template "providerIcon" $brand}}<span class="provider-identity-copy"><span class="name">{{.ID}}</span><span class="sub">{{.Name}}</span></span></span></td>
                   <td><span class="pill">{{.Kind}}</span></td>
                   <td><span class="mono">{{if .Endpoint}}{{.Endpoint}}{{else}}{{index .Settings "path"}}{{end}}</span><span class="sub">bucket: {{.Bucket}}</span></td>
                   <td><span class="mono">{{formatBytes .UsedBytes}} / {{formatBytes .CapacityBytes}}</span><span class="sub">priority {{.Priority}}</span></td>
                   <td>{{if .Enabled}}<span class="pill enabled">enabled</span>{{else}}<span class="pill disabled">disabled</span>{{end}}</td>
-                  <td><form method="post" action="/admin/providers/{{.ID}}/delete"><button class="btn danger" type="submit">Delete</button></form></td>
+                  <td><div class="row-actions"><button class="btn compact secondary" type="button" data-test-provider="{{.ID}}">Test</button><button class="btn compact secondary" type="button" data-inventory-provider="{{.ID}}" data-open-dialog="inventory-dialog">Import</button><form method="post" action="/admin/providers/{{.ID}}/delete"><button class="btn compact danger" type="submit">Delete</button></form></div></td>
                 </tr>
               {{end}}
               </tbody>
@@ -1095,8 +1736,8 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Provider health</h2><p class="card-desc">Comprobación básica de configuración, credenciales y acceso al backend.</p></div></div>
+        <section id="provider-health-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Provider health</h2><p class="card-desc">Basic configuration, credential, and backend access checks.</p></div></div>
           <div class="card-body table-wrap">
             {{if .ProviderHealth}}
             <table class="table">
@@ -1104,7 +1745,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
               <tbody>
               {{range .ProviderHealth}}
                 <tr>
-                  <td><span class="mono">{{.ProviderAccountID}}</span></td>
+                  <td><span class="provider-identity">{{template "providerIcon" (index $.ProviderBrands .ProviderAccountID)}}<span class="provider-identity-copy"><span class="name">{{index $.ProviderNames .ProviderAccountID}}</span><span class="sub mono">{{.ProviderAccountID}}</span></span></span></td>
                   <td><span class="pill {{.Status}}">{{.Status}}</span></td>
                   <td>{{.Message}}</td>
                   <td><span class="mono">{{.LatencyMillis}} ms</span></td>
@@ -1117,17 +1758,17 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Usage by provider and bucket</h2><p class="card-desc">Espacio ocupado según el índice local de objetos gestionados por BucketMux.</p></div></div>
+        <section id="usage-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Usage by provider and bucket</h2><p class="card-desc">Space used according to BucketMux's managed object index.</p></div></div>
           <div class="card-body table-wrap">
             {{if .Usage}}
-            <table class="table"><thead><tr><th>Provider</th><th>Bucket</th><th>Objects</th><th>Size</th></tr></thead><tbody>{{range .Usage}}<tr><td><span class="mono">{{.ProviderAccountID}}</span></td><td>{{.Bucket}}</td><td>{{.ObjectCount}}</td><td><span class="mono">{{formatBytes .Bytes}}</span></td></tr>{{end}}</tbody></table>
+            <table class="table"><thead><tr><th>Provider</th><th>Bucket</th><th>Objects</th><th>Size</th></tr></thead><tbody>{{range .Usage}}<tr><td><span class="provider-identity">{{template "providerIcon" (index $.ProviderBrands .ProviderAccountID)}}<span class="mono">{{.ProviderAccountID}}</span></span></td><td>{{.Bucket}}</td><td>{{.ObjectCount}}</td><td><span class="mono">{{formatBytes .Bytes}}</span></td></tr>{{end}}</tbody></table>
             {{else}}<div class="empty">No indexed objects yet. Upload files to see usage per provider and bucket.</div>{{end}}
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Hooks</h2><p class="card-desc">Llamadas HTTP salientes disparadas por eventos de objetos.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="hook-dialog">New hook</button></div></div>
+        <section id="hooks-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Hooks</h2><p class="card-desc">Outbound HTTP calls triggered by object events.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="hook-dialog">New hook</button></div></div>
           <div class="card-body table-wrap">
             {{if .Hooks}}
             <table class="table">
@@ -1149,8 +1790,8 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Hook delivery history</h2><p class="card-desc">Últimas entregas, intentos y errores. Los reintentos quedan pendientes hasta completarse o agotar intentos.</p></div></div>
+        <section id="hook-deliveries-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Hook delivery history</h2><p class="card-desc">Recent deliveries, attempts, and errors. Retries remain pending until completion or exhaustion.</p></div></div>
           <div class="card-body table-wrap">
             {{if .HookDeliveries}}
             <table class="table">
@@ -1172,18 +1813,18 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Buckets</h2><p class="card-desc">Buckets lógicos expuestos por el gateway.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="bucket-dialog">New bucket</button><button class="btn compact secondary" type="button" data-open-dialog="upload-dialog">Upload object</button></div></div>
+        <section id="buckets-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Buckets</h2><p class="card-desc">Logical buckets exposed by the gateway.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="bucket-dialog">New bucket</button><button class="btn compact secondary" type="button" data-open-dialog="upload-dialog">Upload object</button></div></div>
           <div class="card-body">
             {{if .Buckets}}
-            <div class="table-wrap"><table class="table"><thead><tr><th>Name</th><th>Replication targets</th></tr></thead><tbody>{{range .Buckets}}<tr><td>{{.Name}}</td><td><span class="mono">{{if .ReplicationProviderIDs}}{{join .ReplicationProviderIDs ", "}}{{else}}none{{end}}</span></td></tr>{{end}}</tbody></table></div>
+            <div class="table-wrap"><table class="table"><thead><tr><th>Name</th><th>Replication targets</th><th>Protection</th></tr></thead><tbody>{{range .Buckets}}<tr><td><span class="name">{{.Name}}</span></td><td><span class="mono">{{if .ReplicationProviderIDs}}{{join .ReplicationProviderIDs ", "}}{{else}}none{{end}}</span></td><td><span class="sub">{{if .VersioningEnabled}}versioned · {{end}}{{if .TrashEnabled}}trash {{.TrashRetentionDays}}d · {{end}}{{if .ObjectLockEnabled}}object lock{{end}}{{if and (not .VersioningEnabled) (not .TrashEnabled) (not .ObjectLockEnabled)}}standard{{end}}</span></td></tr>{{end}}</tbody></table></div>
             {{else}}<div class="empty">No buckets yet. Create a logical bucket to expose it through the S3 API.</div>
             {{end}}
           </div>
         </section>
 
-        <section id="object-browser-card" class="card">
-          <div class="card-header"><div><h2 class="card-title">Object browser</h2><p class="card-desc">Navega por los objetos indexados y genera URLs públicas firmadas para acceder a través de BucketMux.</p></div><div class="card-header-actions"><button class="btn compact secondary" type="button" data-open-dialog="upload-dialog">Upload object</button></div></div>
+        <section id="object-browser-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Object browser</h2><p class="card-desc">Browse indexed objects and generate signed public URLs served through BucketMux.</p></div><div class="card-header-actions"><button class="btn compact secondary" type="button" data-open-dialog="upload-dialog">Upload object</button></div></div>
           <div class="card-body">
             {{if .Buckets}}
             <div class="browser-toolbar">
@@ -1192,7 +1833,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
                   {{range .Buckets}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
                 </select>
               </label>
-              <label>Prefix <span class="hint">navega como carpetas usando /</span><input id="object-browser-prefix" placeholder="uploads/"></label>
+              <label>Prefix <span class="hint">browse folders using /</span><input id="object-browser-prefix" placeholder="uploads/"></label>
               <label>Public URL expiry
                 <select id="object-browser-expiry">
                   <option value="900">15 minutes</option>
@@ -1213,15 +1854,15 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
               </table>
             </div>
             <div id="object-public-url-panel" class="public-url-panel" hidden>
-              <label>Public presigned URL <span class="hint">cualquiera con esta URL puede leer el objeto hasta que expire</span><textarea id="object-public-url" readonly></textarea></label>
+              <label>Public presigned URL <span class="hint">anyone with this URL can read the object until it expires</span><textarea id="object-public-url" readonly></textarea></label>
               <div class="actions"><a id="object-public-url-open" class="btn" href="#" target="_blank" rel="noopener">Open URL</a><button id="object-public-url-copy" class="btn secondary" type="button">Copy URL</button></div>
             </div>
             {{else}}<div class="empty">Create a bucket first, then upload objects to browse them.</div>{{end}}
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Migration jobs</h2><p class="card-desc">Historial y progreso de migraciones por bucket/prefix entre proveedores.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="migration-dialog">New migration</button></div></div>
+        <section id="migration-jobs-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Migration jobs</h2><p class="card-desc">History and progress for bucket or prefix migrations between providers.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="migration-dialog">New migration</button></div></div>
           <div class="card-body table-wrap">
             <div id="migration-jobs-empty" class="empty" {{if .MigrationJobs}}hidden{{end}}>No migration jobs yet. Start one to move or copy a bucket/prefix between providers.</div>
             <table id="migration-jobs-table" class="table" {{if not .MigrationJobs}}hidden{{end}}>
@@ -1242,8 +1883,43 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Audit log</h2><p class="card-desc">Operaciones destructivas y de movimiento iniciadas desde el admin.</p></div></div>
+        <section id="inventory-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Remote inventory</h2><p class="card-desc">Discover and import objects that already exist outside BucketMux. Reconcile reports drift without deleting data.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="inventory-dialog">Run inventory</button></div></div>
+          <div class="card-body table-wrap">
+            {{if .InventoryJobs}}<table class="table"><thead><tr><th>Job</th><th>Scope</th><th>Mode</th><th>Discovered</th><th>Imported</th><th>Missing</th><th>Status</th></tr></thead><tbody>{{range .InventoryJobs}}<tr><td><span class="mono">{{.ID}}</span></td><td><span class="mono">{{.ProviderAccountID}} · {{.RemoteBucket}}/{{.Prefix}}</span><span class="sub">logical bucket: {{.Bucket}}</span></td><td>{{.Mode}}</td><td>{{.DiscoveredObjects}}</td><td>{{.ImportedObjects}}</td><td>{{.MissingObjects}}</td><td><span class="pill {{.Status}}">{{.Status}}</span><span class="sub">{{.LastError}}</span></td></tr>{{end}}</tbody></table>{{else}}<div class="empty">No inventory jobs yet. Test a provider, discover its buckets, then import or reconcile.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="repair-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Integrity and auto-repair</h2><p class="card-desc">Durable background scans verify every indexed primary and restore unreadable objects from a healthy replica. Jobs are safe across multiple BucketMux instances.</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="repair-dialog">Run repair scan</button></div></div>
+          <div class="card-body table-wrap">
+            {{if .RepairJobs}}<table class="table"><thead><tr><th>Job</th><th>Scope</th><th>Checked</th><th>Repaired</th><th>Failed</th><th>Status</th></tr></thead><tbody>{{range .RepairJobs}}<tr><td><span class="mono">{{.ID}}</span></td><td><span class="mono">{{.Bucket}}/{{.Prefix}}</span><span class="sub">{{.CurrentKey}}</span></td><td>{{.CheckedObjects}}</td><td>{{.RepairedObjects}}</td><td>{{.FailedObjects}}</td><td><span class="pill {{.Status}}">{{.Status}}</span><span class="sub">{{.LastError}}</span></td></tr>{{end}}</tbody></table>{{else}}<div class="empty">No integrity scans yet. Configure replication, then schedule a scan to verify recoverability.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="security-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Access credentials</h2><p class="card-desc">Scoped S3 keys with roles, bucket/prefix boundaries, rotation and expiry. {{if .OIDCEnabled}}OIDC is enabled for admin access.{{else}}OIDC is available through admin configuration.{{end}}</p></div><div class="card-header-actions"><button class="btn compact" type="button" data-open-dialog="credential-dialog">Create key</button></div></div>
+          <div class="card-body table-wrap">
+            {{if .AccessCredentials}}<table class="table"><thead><tr><th>Name</th><th>Access key</th><th>Role</th><th>Scope</th><th>Expires</th><th>Status</th><th></th></tr></thead><tbody>{{range .AccessCredentials}}<tr><td><span class="name">{{.Name}}</span><span class="sub mono">{{.ID}}</span></td><td><span class="mono">{{.AccessKey}}</span></td><td><span class="pill">{{.Role}}</span></td><td><span class="mono">{{join .BucketPatterns ", "}}</span><span class="sub">prefix {{join .PrefixPatterns ", "}}</span></td><td><span class="mono">{{if .ExpiresAt.IsZero}}never{{else}}{{.ExpiresAt}}{{end}}</span></td><td>{{if .Enabled}}<span class="pill enabled">enabled</span>{{else}}<span class="pill disabled">disabled</span>{{end}}</td><td><button class="btn compact secondary" type="button" data-rotate-credential="{{.ID}}">Rotate</button></td></tr>{{end}}</tbody></table>{{else}}<div class="empty">No scoped keys yet. The root S3 key from configuration remains active for recovery.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="protection-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Recoverable trash</h2><p class="card-desc">Objects remain recoverable until their bucket retention period expires. Lifecycle purges expired entries.</p></div><div class="card-header-actions"><button id="lifecycle-run" class="btn compact secondary" type="button">Run lifecycle</button></div></div>
+          <div class="card-body table-wrap">
+            {{if .TrashObjects}}<table class="table"><thead><tr><th>Object</th><th>Provider</th><th>Deleted</th><th>Purge after</th><th></th></tr></thead><tbody>{{range .TrashObjects}}<tr><td><span class="name">{{.Object.Bucket}}/{{.Object.Key}}</span><span class="sub">{{formatBytes .Object.Size}}</span></td><td><span class="mono">{{.Object.ProviderAccountID}}</span></td><td><span class="mono">{{.DeletedAt}}</span></td><td><span class="mono">{{.PurgeAfter}}</span></td><td><button class="btn compact secondary" type="button" data-restore-trash="{{.ID}}">Restore</button></td></tr>{{end}}</tbody></table>{{else}}<div class="empty">Trash is empty. Enable it per bucket to make normal deletes recoverable.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="cost-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Cost optimizer</h2><p class="card-desc">Estimated opportunities based on configured storage price and available capacity. Review before starting a migration.</p></div><div class="card-header-actions"><button class="btn compact secondary" type="button" data-open-dialog="placement-dialog">Simulate placement</button></div></div>
+          <div class="card-body table-wrap">
+            {{if .CostOptimizations}}<table class="table"><thead><tr><th>From</th><th>To</th><th>Data</th><th>Estimated saving / month</th></tr></thead><tbody>{{range .CostOptimizations}}<tr><td><span class="mono">{{.SourceProviderID}}</span></td><td><span class="mono">{{.TargetProviderID}}</span></td><td>{{formatBytes .Bytes}}</td><td><span class="name">{{printf "$%.2f" .EstimatedMonthlySaving}}</span></td></tr>{{end}}</tbody></table>{{else}}<div class="empty">Add cost per GB/month to provider routing settings to receive optimization suggestions.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="audit-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Audit log</h2><p class="card-desc">Destructive and move operations initiated from the admin.</p></div></div>
           <div class="card-body table-wrap">
             {{if .AuditEvents}}
             <table class="table">
@@ -1265,8 +1941,8 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
       </div>
 
       <aside class="stack">
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Action center</h2><p class="card-desc">Mantén el panel limpio: los formularios se abren bajo demanda.</p></div></div>
+        <section id="action-center-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Action center</h2><p class="card-desc">Keep the dashboard focused: forms open only when requested.</p></div></div>
           <div class="card-body">
             <div class="form-grid one">
               <button class="btn" type="button" data-open-dialog="provider-dialog">Add / update provider</button>
@@ -1279,66 +1955,107 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-header"><div><h2 class="card-title">Quick test</h2><p class="card-desc">Con las credenciales locales por defecto.</p></div></div>
+        <section id="quick-test-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Quick test</h2><p class="card-desc">Using the default local development credentials.</p></div></div>
           <div class="card-body"><pre class="code">curl -X PUT http://localhost:8080/images/demo.txt \
   -H 'X-S3LS-Access-Key: local-access-key' \
   -H 'X-S3LS-Secret-Key: local-secret-key' \
-  --data 'hola mundo'</pre></div>
+  --data 'hello world'</pre></div>
         </section>
       </aside>
     </div>
 
     <dialog id="provider-dialog" class="admin-dialog" aria-labelledby="provider-dialog-title">
-      <div class="dialog-header"><div><h2 id="provider-dialog-title" class="card-title">Add / update provider</h2><p class="card-desc">Usa el mismo ID para actualizar. Deja el secret vacío para conservar el actual.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-header"><div><h2 id="provider-dialog-title" class="card-title">Choose a provider</h2><p id="provider-dialog-description" class="card-desc">Start with a tested preset, then enter the credentials for your account.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
       <div class="dialog-body">
-        <form method="post" action="/admin/providers">
-          <div class="form-grid one">
-            <label>ID<input required name="id" placeholder="r2-main"></label>
-            <label>Name<input name="name" placeholder="Cloudflare R2 main"></label>
-            <label>Type<select name="kind" required><option value="local">local</option><option value="s3-compatible">s3-compatible</option><option value="cloudinary">cloudinary</option><option value="vercel-blob">vercel-blob</option></select></label>
-            <label>Remote bucket / cloud name<input required name="bucket" placeholder="images"></label>
-            <label>Endpoint <span class="hint">S3-compatible only</span><input name="endpoint" placeholder="https://ACCOUNT.r2.cloudflarestorage.com"></label>
-            <label>Region<input name="region" value="auto"></label>
-            <label>Access key / API key<input name="access_key" autocomplete="off"></label>
-            <label>Secret key / API secret<input name="secret_key" type="password" autocomplete="new-password" placeholder="Keep empty to preserve"></label>
-            <div class="form-grid">
-              <label>Capacity bytes<input name="capacity_bytes" type="number" value="10737418240"></label>
-              <label>Priority<input name="priority" type="number" value="100"></label>
-            </div>
-            <label>Local path <span class="hint">kind=local</span><input name="settings_path" placeholder="./data/local-provider"></label>
-            <label>Cloudinary cloud_name<input name="settings_cloud_name" placeholder="my-cloud"></label>
-            <label>Vercel Blob access <span class="hint">kind=vercel-blob; public or private</span><input name="settings_vercel_access" placeholder="public"></label>
-            <label>Vercel Blob store_id <span class="hint">optional if token includes it</span><input name="settings_vercel_store_id" placeholder="store-id"></label>
-            <label>Cost per GB/month <span class="hint">policy: lower cost wins on priority tie</span><input name="settings_cost_per_gb_month" placeholder="0.015"></label>
-            <label>Max object size bytes <span class="hint">policy: skip provider for larger objects</span><input name="settings_max_object_size_bytes" type="number" placeholder="104857600"></label>
-            <label>Min free bytes <span class="hint">policy: reserve capacity headroom</span><input name="settings_min_free_bytes" type="number" placeholder="1073741824"></label>
-            <label class="checkbox"><input type="checkbox" name="enabled" checked> Enabled</label>
+        <div id="provider-catalog-view">
+          <p class="provider-catalog-intro">Provider presets fill compatible endpoints and defaults automatically. Credentials remain encrypted and are never shown again.</p>
+          <div id="provider-catalog" class="provider-catalog">
+            <button class="provider-preset" type="button" data-provider-preset="aws">{{template "providerIcon" "aws"}}<span class="provider-preset-copy"><strong>Amazon S3</strong><span>AWS regions and S3 credentials</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="cloudflare">{{template "providerIcon" "cloudflare"}}<span class="provider-preset-copy"><strong>Cloudflare R2</strong><span>S3-compatible, zero egress fees</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="gcs">{{template "providerIcon" "gcs"}}<span class="provider-preset-copy"><strong>Google Cloud Storage</strong><span>XML API interoperability keys</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="backblaze">{{template "providerIcon" "backblaze"}}<span class="provider-preset-copy"><strong>Backblaze B2</strong><span>S3-compatible application keys</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="digitalocean">{{template "providerIcon" "digitalocean"}}<span class="provider-preset-copy"><strong>DigitalOcean Spaces</strong><span>Region-aware Spaces endpoint</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="wasabi">{{template "providerIcon" "wasabi"}}<span class="provider-preset-copy"><strong>Wasabi</strong><span>S3-compatible hot cloud storage</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="minio">{{template "providerIcon" "minio"}}<span class="provider-preset-copy"><strong>MinIO</strong><span>Self-hosted S3-compatible storage</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="cloudinary">{{template "providerIcon" "cloudinary"}}<span class="provider-preset-copy"><strong>Cloudinary</strong><span>Image storage and delivery API</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="vercel">{{template "providerIcon" "vercel"}}<span class="provider-preset-copy"><strong>Vercel Blob</strong><span>Read-write token configuration</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="local">{{template "providerIcon" "local"}}<span class="provider-preset-copy"><strong>Local disk</strong><span>Filesystem storage for this instance</span></span></button>
+            <button class="provider-preset" type="button" data-provider-preset="custom">{{template "providerIcon" "custom"}}<span class="provider-preset-copy"><strong>Custom S3-compatible</strong><span>Any path-style S3 endpoint</span></span></button>
           </div>
-          <div class="actions"><button class="btn" type="submit">Save provider</button><button class="btn secondary" type="reset">Reset</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
-        </form>
+          <p class="provider-icon-credit">Brand icons provided by <a href="https://thesvg.org/" target="_blank" rel="noopener noreferrer">theSVG</a>. Trademarks belong to their respective owners.</p>
+        </div>
+
+        <div id="provider-config-view" hidden>
+          <div class="provider-config-summary">
+            <span id="selected-provider-icon" class="provider-icon provider-icon-custom" aria-hidden="true"><span id="selected-provider-icon-fallback" class="provider-icon-fallback">S3</span><img id="selected-provider-icon-image" alt="" referrerpolicy="no-referrer" hidden></span>
+            <span class="provider-config-title"><strong id="selected-provider-name">Custom S3-compatible</strong><span id="selected-provider-summary">Configure your storage account.</span></span>
+            <button id="provider-back" class="btn secondary compact provider-back" type="button">Change</button>
+          </div>
+          <form id="provider-form" method="post" action="/admin/providers">
+            <input id="provider-kind" type="hidden" name="kind" value="s3-compatible">
+            <div class="form-grid one">
+              <label>Account ID <span class="hint">unique inside BucketMux</span><input id="provider-id" required name="id" placeholder="r2-main"></label>
+              <label>Display name<input id="provider-name" name="name" placeholder="Cloudflare R2 main"></label>
+              <label>Remote bucket<input id="provider-bucket" required name="bucket" placeholder="images"></label>
+
+              <div class="provider-fields-title">Connection</div>
+              <label class="provider-field" data-provider-field="endpoint">Endpoint<input id="provider-endpoint" name="endpoint" type="url" placeholder="https://s3.example.com"></label>
+              <label class="provider-field" data-provider-field="region">Region<input id="provider-region" name="region" value="auto"></label>
+              <label class="provider-field" data-provider-field="access-key"><span id="provider-access-label">Access key</span><input id="provider-access-key" name="access_key" autocomplete="off"></label>
+              <label class="provider-field" data-provider-field="secret-key"><span id="provider-secret-label">Secret key</span> <span class="hint">leave empty when updating to preserve it</span><input id="provider-secret-key" name="secret_key" type="password" autocomplete="new-password" placeholder="Enter credential"></label>
+              <label class="provider-field" data-provider-field="local-path">Local path<input id="provider-local-path" name="settings_path" placeholder="./data/local-provider"></label>
+              <label class="provider-field" data-provider-field="cloud-name">Cloud name<input id="provider-cloud-name" name="settings_cloud_name" placeholder="my-cloud"></label>
+              <label class="provider-field" data-provider-field="vercel-access">Blob access<select id="provider-vercel-access" name="settings_vercel_access"><option value="public">public</option><option value="private">private</option></select></label>
+              <label class="provider-field" data-provider-field="vercel-store">Store ID <span class="hint">optional when included in the token</span><input id="provider-vercel-store" name="settings_vercel_store_id" placeholder="store-id"></label>
+
+              <details class="provider-advanced">
+                <summary>Advanced routing and capacity</summary>
+                <div class="provider-advanced-body form-grid one">
+                  <div class="form-grid">
+                    <label>Capacity bytes<input id="provider-capacity" name="capacity_bytes" type="number" value="10737418240"></label>
+                    <label>Priority<input id="provider-priority" name="priority" type="number" value="100"></label>
+                  </div>
+                  <label>Cost per GB/month <span class="hint">lower cost wins on priority tie</span><input name="settings_cost_per_gb_month" placeholder="0.015"></label>
+                  <label>Max object size bytes <span class="hint">skip this provider for larger objects</span><input name="settings_max_object_size_bytes" type="number" placeholder="104857600"></label>
+                  <label>Min free bytes <span class="hint">reserve capacity headroom</span><input name="settings_min_free_bytes" type="number" placeholder="1073741824"></label>
+                  <label class="checkbox"><input type="checkbox" name="enabled" checked> Enabled</label>
+                </div>
+              </details>
+            </div>
+            <div class="actions"><button class="btn" type="submit">Save provider</button><button id="provider-reset" class="btn secondary" type="button">Reset fields</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
+          </form>
+        </div>
       </div>
     </dialog>
 
     <dialog id="bucket-dialog" class="admin-dialog" aria-labelledby="bucket-dialog-title">
-      <div class="dialog-header"><div><h2 id="bucket-dialog-title" class="card-title">Create / update bucket</h2><p class="card-desc">Configura buckets lógicos y sus proveedores de réplica.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-header"><div><h2 id="bucket-dialog-title" class="card-title">Create / update bucket</h2><p class="card-desc">Configure logical buckets and their replication providers.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
       <div class="dialog-body">
         <form method="post" action="/admin/buckets">
           <div class="form-grid one">
             <label>Bucket name<input required name="name" placeholder="images"></label>
-            <label>Replication providers <span class="hint">opcional; selecciona 0 o más destinos de réplica</span>
+            <label>Replication providers <span class="hint">optional; select zero or more replication targets</span>
               <select name="replication_provider_ids" multiple size="5">
                 {{range .Providers}}<option value="{{.ID}}">{{.ID}} — {{.Name}}</option>{{end}}
               </select>
             </label>
+            <div class="provider-fields-title">Data protection</div>
+            <label class="checkbox"><input type="checkbox" name="versioning_enabled"> Version every overwrite and support S3 delete markers</label>
+            <label class="checkbox"><input type="checkbox" name="trash_enabled"> Keep deleted objects in recoverable trash</label>
+            <label>Trash retention days<input name="trash_retention_days" type="number" min="1" value="30"></label>
+            <label class="checkbox"><input type="checkbox" name="object_lock_enabled"> Enable Object Lock <span class="hint">also enables versioning</span></label>
+            <div class="form-grid"><label>Default retention mode<select name="default_retention_mode"><option value="">None</option><option value="GOVERNANCE">Governance</option><option value="COMPLIANCE">Compliance</option></select></label><label>Default retention days<input name="default_retention_days" type="number" min="0" value="0"></label></div>
+            <div class="provider-fields-title">Lifecycle</div>
+            <div class="form-grid"><label>Prefix<input name="lifecycle_prefix" placeholder="logs/"></label><label>Expire current objects after days<input name="lifecycle_expire_days" type="number" min="0" value="0"></label></div>
           </div>
-          <div class="actions"><button class="btn" type="submit">Save bucket policy</button><button class="btn secondary" type="reset">Reset</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
+          <div class="actions"><button class="btn" type="submit">Save bucket settings</button><button class="btn secondary" type="reset">Reset</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
         </form>
       </div>
     </dialog>
 
     <dialog id="upload-dialog" class="admin-dialog" aria-labelledby="upload-dialog-title">
-      <div class="dialog-header"><div><h2 id="upload-dialog-title" class="card-title">Upload object</h2><p class="card-desc">Sube un archivo a un bucket lógico usando el routing normal de BucketMux.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-header"><div><h2 id="upload-dialog-title" class="card-title">Upload object</h2><p class="card-desc">Upload a file to a logical bucket using normal BucketMux routing.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
       <div class="dialog-body">
         <form id="admin-upload-form" method="post" action="/admin/upload" enctype="multipart/form-data">
           <div class="form-grid one">
@@ -1347,7 +2064,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
                 {{range .Buckets}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
               </select>
             </label>
-            <label>Object key <span class="hint">opcional; usa el nombre del archivo si está vacío</span><input name="key" placeholder="uploads/photo.jpg"></label>
+            <label>Object key <span class="hint">optional; uses the file name when empty</span><input name="key" placeholder="uploads/photo.jpg"></label>
             <label>File<input required name="file" type="file"></label>
           </div>
           <div id="upload-status" class="notice" hidden style="margin-top:16px;margin-bottom:0"></div>
@@ -1357,7 +2074,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
     </dialog>
 
     <dialog id="hook-dialog" class="admin-dialog" aria-labelledby="hook-dialog-title">
-      <div class="dialog-header"><div><h2 id="hook-dialog-title" class="card-title">Add / update HTTP hook</h2><p class="card-desc">Se ejecuta después de que BucketMux confirme el cambio en su índice.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-header"><div><h2 id="hook-dialog-title" class="card-title">Add / update HTTP hook</h2><p class="card-desc">Runs after BucketMux confirms the change in its object index.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
       <div class="dialog-body">
         <form method="post" action="/admin/hooks">
           <div class="form-grid one">
@@ -1365,7 +2082,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
             <label>Name<input name="name" placeholder="Notify API"></label>
             <label>URL<input required name="url" type="url" placeholder="https://example.com/bucketmux/hooks"></label>
             <label>Method<select name="method"><option value="POST">POST</option><option value="PUT">PUT</option><option value="PATCH">PATCH</option><option value="GET">GET</option></select></label>
-            <label>Secret headers <span class="hint">uno por línea, formato Header-Name: value; se cifran y no se vuelven a mostrar</span><textarea name="headers" placeholder="X-Webhook-Secret: super-secret&#10;Authorization: Bearer token"></textarea></label>
+            <label>Secret headers <span class="hint">one per line as Header-Name: value; encrypted and never displayed again</span><textarea name="headers" placeholder="X-Webhook-Secret: super-secret&#10;Authorization: Bearer token"></textarea></label>
             <label class="checkbox"><input type="checkbox" name="events" value="object.created" checked> object.created</label>
             <label class="checkbox"><input type="checkbox" name="events" value="object.deleted"> object.deleted</label>
             <label class="checkbox"><input type="checkbox" name="enabled" checked> Enabled</label>
@@ -1376,7 +2093,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
     </dialog>
 
     <dialog id="migration-dialog" class="admin-dialog" aria-labelledby="migration-dialog-title">
-      <div class="dialog-header"><div><h2 id="migration-dialog-title" class="card-title">Migrate bucket/prefix</h2><p class="card-desc">Crea un job en background para copiar o mover objetos entre proveedores.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-header"><div><h2 id="migration-dialog-title" class="card-title">Migrate bucket/prefix</h2><p class="card-desc">Create a background job to copy or move objects between providers.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
       <div class="dialog-body">
         <form id="migration-form">
           <div class="form-grid one">
@@ -1385,7 +2102,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
                 {{range .Buckets}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
               </select>
             </label>
-            <label>Prefix <span class="hint">opcional; vacío migra todo el bucket</span><input id="migration-prefix" placeholder="uploads/2026/"></label>
+            <label>Prefix <span class="hint">optional; empty migrates the entire bucket</span><input id="migration-prefix" placeholder="uploads/2026/"></label>
             <label>From provider
               <select id="migration-source-provider" required>
                 {{range .Providers}}<option value="{{.ID}}">{{.ID}} — {{.Name}}</option>{{end}}
@@ -1402,7 +2119,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
                 <option value="move">Move — make target primary and delete source best-effort</option>
               </select>
             </label>
-            <label id="migration-confirm-label" hidden>Move confirmation <span class="hint">escribe exactamente: Migrar permanentemente</span><input id="migration-confirm" autocomplete="off" placeholder="Migrar permanentemente"></label>
+            <label id="migration-confirm-label" hidden>Move confirmation <span class="hint">type exactly: Migrate permanently</span><input id="migration-confirm" autocomplete="off" placeholder="Migrate permanently"></label>
           </div>
           <div id="migration-status" class="notice" hidden style="margin-top:16px;margin-bottom:0"></div>
           <div class="actions"><button id="migration-submit" class="btn" type="submit">Start migration job</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
@@ -1410,14 +2127,73 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
       </div>
     </dialog>
 
+    <dialog id="inventory-dialog" class="admin-dialog" aria-labelledby="inventory-dialog-title">
+      <div class="dialog-header"><div><h2 id="inventory-dialog-title" class="card-title">Import or reconcile remote objects</h2><p class="card-desc">Test credentials and inspect remote buckets before creating a durable inventory job.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-body">
+        <form id="inventory-form">
+          <div class="form-grid one">
+            <label>Provider<select id="inventory-provider" required>{{range .Providers}}<option value="{{.ID}}">{{.ID}} — {{.Name}}</option>{{end}}</select></label>
+            <div class="actions"><button id="inventory-test" class="btn secondary compact" type="button">Test connection</button><button id="inventory-discover" class="btn secondary compact" type="button">Discover buckets</button></div>
+            <label>Logical BucketMux bucket<select id="inventory-logical-bucket" required>{{range .Buckets}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+            <label>Remote provider bucket<input id="inventory-bucket" required list="inventory-bucket-options" placeholder="upstream-images"><datalist id="inventory-bucket-options"></datalist></label>
+            <label>Prefix <span class="hint">optional</span><input id="inventory-prefix" placeholder="archive/"></label>
+            <label>Mode<select id="inventory-mode"><option value="import">Import missing objects</option><option value="reconcile">Import and report indexed objects missing remotely</option></select></label>
+          </div>
+          <div id="inventory-status" class="notice" hidden style="margin-top:16px;margin-bottom:0"></div>
+          <div class="actions"><button class="btn" type="submit">Start inventory</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
+        </form>
+      </div>
+    </dialog>
+
+    <dialog id="credential-dialog" class="admin-dialog" aria-labelledby="credential-dialog-title">
+      <div class="dialog-header"><div><h2 id="credential-dialog-title" class="card-title">Create scoped S3 key</h2><p class="card-desc">The secret is displayed once. Store it in your secret manager before closing.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-body">
+        <form id="credential-form">
+          <div class="form-grid one">
+            <label>Name<input id="credential-name" required placeholder="Media read-only"></label>
+            <label>Role<select id="credential-role"><option value="read-write">Read and write</option><option value="read-only">Read only</option><option value="admin">S3 administrator</option></select></label>
+            <label>Bucket patterns <span class="hint">comma-separated globs</span><input id="credential-buckets" value="*" placeholder="assets-*, backups"></label>
+            <label>Prefix patterns <span class="hint">comma-separated globs</span><input id="credential-prefixes" value="*" placeholder="public/*"></label>
+            <label>Expires at <span class="hint">optional, RFC3339</span><input id="credential-expires" type="datetime-local"></label>
+            <label class="checkbox"><input id="credential-enabled" type="checkbox" checked> Enabled</label>
+          </div>
+          <div id="credential-status" class="notice" hidden style="margin-top:16px;margin-bottom:0"></div>
+          <div id="credential-secret-panel" class="public-url-panel" hidden><label>Secret key<textarea id="credential-secret" readonly></textarea></label><div class="actions"><button id="credential-copy" class="btn secondary" type="button">Copy credentials</button></div></div>
+          <div class="actions"><button class="btn" type="submit">Create key</button><button class="btn secondary" type="button" data-dialog-close>Close</button></div>
+        </form>
+      </div>
+    </dialog>
+
+    <dialog id="repair-dialog" class="admin-dialog" aria-labelledby="repair-dialog-title">
+      <div class="dialog-header"><div><h2 id="repair-dialog-title" class="card-title">Run integrity and repair scan</h2><p class="card-desc">Every matching primary is checked. Missing or unreadable data is restored only when a healthy replica is available.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-body">
+        <form id="repair-form">
+          <div class="form-grid one">
+            <label>Bucket<select id="repair-bucket" required>{{range .Buckets}}<option value="{{.Name}}">{{.Name}}</option>{{end}}</select></label>
+            <label>Prefix <span class="hint">optional</span><input id="repair-prefix" placeholder="archive/"></label>
+          </div>
+          <div id="repair-status" class="notice" hidden style="margin-top:16px;margin-bottom:0"></div>
+          <div class="actions"><button class="btn" type="submit">Start durable scan</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
+        </form>
+      </div>
+    </dialog>
+
+    <dialog id="placement-dialog" class="admin-dialog" aria-labelledby="placement-dialog-title">
+      <div class="dialog-header"><div><h2 id="placement-dialog-title" class="card-title">Simulate object placement</h2><p class="card-desc">Preview eligibility, policy constraints, capacity and monthly storage cost without uploading.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-body">
+        <form id="placement-form"><div class="form-grid"><label>Bucket<input id="placement-bucket" placeholder="images"></label><label>Object size bytes<input id="placement-size" type="number" min="0" value="104857600"></label></div><div class="actions"><button class="btn" type="submit">Simulate</button></div></form>
+        <div id="placement-status" class="notice" hidden style="margin-top:16px"></div><div id="placement-results" class="table-wrap" style="margin-top:16px"></div>
+      </div>
+    </dialog>
+
     <dialog id="delete-object-dialog" class="admin-dialog" aria-labelledby="delete-object-dialog-title">
-      <div class="dialog-header"><div><h2 id="delete-object-dialog-title" class="card-title">Delete object permanently</h2><p class="card-desc">Esta acción elimina el objeto del proveedor primario, sus réplicas conocidas y el índice local.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
+      <div class="dialog-header"><div><h2 id="delete-object-dialog-title" class="card-title">Delete object</h2><p class="card-desc">Versioned buckets create a delete marker; trash-enabled buckets keep a recoverable copy. Standard buckets delete immediately.</p></div><button class="dialog-close" type="button" data-dialog-close aria-label="Close">×</button></div>
       <div class="dialog-body">
         <form id="delete-object-form">
-          <div class="notice error">Acción destructiva. Para confirmar escribe exactamente: <strong>Eliminar permanentemente</strong></div>
+          <div class="notice error">This changes the live S3 key. To confirm, type exactly: <strong>Delete permanently</strong></div>
           <div class="form-grid one">
             <label>Object<input id="delete-object-key" readonly></label>
-            <label>Confirmation<input id="delete-object-confirmation" autocomplete="off" placeholder="Eliminar permanentemente"></label>
+            <label>Confirmation<input id="delete-object-confirmation" autocomplete="off" placeholder="Delete permanently"></label>
           </div>
           <div class="actions"><button id="delete-object-submit" class="btn danger" type="submit" disabled>Delete object</button><button class="btn secondary" type="button" data-dialog-close>Cancel</button></div>
         </form>
@@ -1425,9 +2201,182 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
     </dialog>
 
     <p class="footer">BucketMux · Embedded admin · JSON API available under /admin/api/* · usage: /admin/api/usage</p>
-  </main>
+    </main>
+    </div>
+  </div>
   <script>
     (() => {
+      const root = document.documentElement;
+      const themeToggle = document.getElementById('theme-toggle');
+      let storedTheme = '';
+      try { storedTheme = window.localStorage.getItem('bucketmux-admin-theme') || ''; } catch (_) {}
+      if (storedTheme === 'dark' || storedTheme === 'light') root.dataset.theme = storedTheme;
+      const updateThemeControl = () => {
+        if (!themeToggle) return;
+        const dark = root.dataset.theme === 'dark';
+        themeToggle.setAttribute('aria-pressed', dark ? 'true' : 'false');
+        themeToggle.title = dark ? 'Use light theme' : 'Use dark theme';
+      };
+      updateThemeControl();
+      if (themeToggle) themeToggle.addEventListener('click', () => {
+        root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+        try { window.localStorage.setItem('bucketmux-admin-theme', root.dataset.theme); } catch (_) {}
+        updateThemeControl();
+      });
+
+      const sidebar = document.getElementById('admin-sidebar');
+      const sidebarToggle = document.getElementById('sidebar-toggle');
+      const navLinks = document.querySelectorAll('.nav-link');
+      const closeSidebar = () => {
+        if (sidebar) sidebar.classList.remove('open');
+        if (sidebarToggle) sidebarToggle.setAttribute('aria-expanded', 'false');
+      };
+      if (sidebarToggle) sidebarToggle.addEventListener('click', () => {
+        const open = sidebar && sidebar.classList.toggle('open');
+        sidebarToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      });
+      navLinks.forEach((link) => link.addEventListener('click', () => {
+        navLinks.forEach((item) => item.classList.toggle('active', item === link));
+        closeSidebar();
+      }));
+
+      const dashboardSearch = document.getElementById('dashboard-search');
+      const dashboardSearchEmpty = document.getElementById('dashboard-search-empty');
+      const searchableSections = Array.from(document.querySelectorAll('[data-search-section]'));
+      const filterDashboard = () => {
+        if (!dashboardSearch) return;
+        const query = dashboardSearch.value.trim().toLocaleLowerCase();
+        let matches = 0;
+        searchableSections.forEach((section) => {
+          const visible = !query || section.textContent.toLocaleLowerCase().includes(query);
+          section.classList.toggle('filtered-out', !visible);
+          if (visible) matches++;
+        });
+        if (dashboardSearchEmpty) dashboardSearchEmpty.hidden = matches > 0;
+      };
+      if (dashboardSearch) dashboardSearch.addEventListener('input', filterDashboard);
+      document.addEventListener('keydown', (event) => {
+        const target = event.target;
+        const editing = target && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName);
+        if (event.key === '/' && !editing && dashboardSearch) {
+          event.preventDefault();
+          dashboardSearch.focus();
+        } else if (event.key === 'Escape' && dashboardSearch && document.activeElement === dashboardSearch) {
+          dashboardSearch.value = '';
+          filterDashboard();
+          dashboardSearch.blur();
+        }
+      });
+
+      const providerCatalogView = document.getElementById('provider-catalog-view');
+      const providerConfigView = document.getElementById('provider-config-view');
+      const providerDialogTitle = document.getElementById('provider-dialog-title');
+      const providerDialogDescription = document.getElementById('provider-dialog-description');
+      const providerForm = document.getElementById('provider-form');
+      const providerReset = document.getElementById('provider-reset');
+      const providerBack = document.getElementById('provider-back');
+      const providerKind = document.getElementById('provider-kind');
+      const providerID = document.getElementById('provider-id');
+      const providerName = document.getElementById('provider-name');
+      const providerBucket = document.getElementById('provider-bucket');
+      const providerEndpoint = document.getElementById('provider-endpoint');
+      const providerRegion = document.getElementById('provider-region');
+      const providerAccessLabel = document.getElementById('provider-access-label');
+      const providerSecretLabel = document.getElementById('provider-secret-label');
+      const providerLocalPath = document.getElementById('provider-local-path');
+      const providerCloudName = document.getElementById('provider-cloud-name');
+      const providerVercelAccess = document.getElementById('provider-vercel-access');
+      const selectedProviderIcon = document.getElementById('selected-provider-icon');
+      const selectedProviderIconImage = document.getElementById('selected-provider-icon-image');
+      const selectedProviderIconFallback = document.getElementById('selected-provider-icon-fallback');
+      const selectedProviderName = document.getElementById('selected-provider-name');
+      const selectedProviderSummary = document.getElementById('selected-provider-summary');
+      const providerIconBase = 'https://cdn.jsdelivr.net/gh/glincker/thesvg@7870bc1c5f657d9accbb7f96cc457b8dd3363ee8/public/icons/';
+      const providerPresets = {
+        aws: { name: 'Amazon S3', summary: 'AWS region and S3 access credentials.', kind: 's3-compatible', id: 'aws-s3', bucket: 'images', region: 'us-east-1', endpointTemplate: 'https://s3.{region}.amazonaws.com', icon: providerIconBase + 'aws/color.svg', mark: 'aws', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        cloudflare: { name: 'Cloudflare R2', summary: 'Paste the S3 API endpoint from your R2 bucket settings.', kind: 's3-compatible', id: 'cloudflare-r2', bucket: 'images', region: 'auto', endpoint: '', endpointPlaceholder: 'https://ACCOUNT_ID.r2.cloudflarestorage.com', icon: providerIconBase + 'cloudflare/color.svg', mark: 'R2', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        gcs: { name: 'Google Cloud Storage', summary: 'Use HMAC interoperability access and secret keys.', kind: 's3-compatible', id: 'google-cloud-storage', bucket: 'images', region: 'auto', endpoint: 'https://storage.googleapis.com', icon: providerIconBase + 'google-cloud/default.svg', mark: 'G', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        backblaze: { name: 'Backblaze B2', summary: 'Use an S3-compatible application key for the selected region.', kind: 's3-compatible', id: 'backblaze-b2', bucket: 'images', region: 'us-west-004', endpointTemplate: 'https://s3.{region}.backblazeb2.com', icon: providerIconBase + 'backblaze/default.svg', mark: 'B2', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        digitalocean: { name: 'DigitalOcean Spaces', summary: 'Use a Spaces access key and the region that owns the Space.', kind: 's3-compatible', id: 'digitalocean-spaces', bucket: 'images', region: 'nyc3', endpointTemplate: 'https://{region}.digitaloceanspaces.com', icon: providerIconBase + 'digitalocean/default.svg', mark: 'DO', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        wasabi: { name: 'Wasabi', summary: 'Use Wasabi access credentials and the bucket region.', kind: 's3-compatible', id: 'wasabi', bucket: 'images', region: 'us-east-1', endpointTemplate: 'https://s3.{region}.wasabisys.com', icon: providerIconBase + 'wasabi/default.svg', mark: 'W', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        minio: { name: 'MinIO', summary: 'Point BucketMux at your self-hosted MinIO API endpoint.', kind: 's3-compatible', id: 'minio', bucket: 'images', region: 'us-east-1', endpoint: 'http://localhost:9000', icon: providerIconBase + 'minio/default.svg', mark: 'M', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        cloudinary: { name: 'Cloudinary', summary: 'Enter the cloud name, API key, and API secret.', kind: 'cloudinary', id: 'cloudinary', bucket: 'media', region: 'auto', icon: providerIconBase + 'cloudinary/default.svg', mark: 'C', accessLabel: 'API key', secretLabel: 'API secret', fields: ['access-key', 'secret-key', 'cloud-name'] },
+        vercel: { name: 'Vercel Blob', summary: 'A read-write token is enough; the store ID is normally detected.', kind: 'vercel-blob', id: 'vercel-blob', bucket: 'blob', region: 'auto', icon: providerIconBase + 'vercel/mono.svg', mark: '▲', secretLabel: 'Read-write token', fields: ['secret-key', 'vercel-access', 'vercel-store'] },
+        local: { name: 'Local disk', summary: 'Store objects on a filesystem path available to this instance.', kind: 'local', id: 'local-disk', bucket: 'images', region: 'auto', localPath: './data/local-provider', mark: 'LD', fields: ['local-path'] },
+        custom: { name: 'Custom S3-compatible', summary: 'Configure any path-style S3-compatible endpoint.', kind: 's3-compatible', id: 'custom-s3', bucket: 'images', region: 'auto', endpoint: '', endpointPlaceholder: 'https://s3.example.com', mark: 'S3', fields: ['endpoint', 'region', 'access-key', 'secret-key'] }
+      };
+      let selectedProviderPreset = null;
+
+      const providerEndpointFor = (preset) => {
+        if (!preset) return '';
+        if (preset.endpointTemplate) return preset.endpointTemplate.replace('{region}', providerRegion && providerRegion.value ? providerRegion.value : preset.region);
+        return preset.endpoint || '';
+      };
+
+      const showProviderCatalog = () => {
+        selectedProviderPreset = null;
+        if (providerCatalogView) providerCatalogView.hidden = false;
+        if (providerConfigView) providerConfigView.hidden = true;
+        if (providerDialogTitle) providerDialogTitle.textContent = 'Choose a provider';
+        if (providerDialogDescription) providerDialogDescription.textContent = 'Start with a tested preset, then enter the credentials for your account.';
+      };
+
+      const applyProviderPreset = (presetKey) => {
+        const preset = providerPresets[presetKey];
+        if (!preset || !providerForm) return;
+        selectedProviderPreset = presetKey;
+        providerForm.reset();
+        document.querySelectorAll('[data-provider-field]').forEach((field) => {
+          field.hidden = !preset.fields.includes(field.getAttribute('data-provider-field'));
+        });
+        if (providerKind) providerKind.value = preset.kind;
+        if (providerID) providerID.value = preset.id;
+        if (providerName) providerName.value = preset.name;
+        if (providerBucket) providerBucket.value = preset.bucket;
+        if (providerRegion) providerRegion.value = preset.region;
+        if (providerEndpoint) {
+          providerEndpoint.value = providerEndpointFor(preset);
+          providerEndpoint.placeholder = preset.endpointPlaceholder || providerEndpoint.value || 'https://s3.example.com';
+          providerEndpoint.required = preset.fields.includes('endpoint');
+        }
+        if (providerLocalPath) {
+          providerLocalPath.value = preset.localPath || '';
+          providerLocalPath.required = preset.fields.includes('local-path');
+        }
+        if (providerCloudName) {
+          providerCloudName.value = '';
+          providerCloudName.required = preset.fields.includes('cloud-name');
+        }
+        if (providerVercelAccess) providerVercelAccess.value = 'public';
+        if (providerAccessLabel) providerAccessLabel.textContent = preset.accessLabel || 'Access key';
+        if (providerSecretLabel) providerSecretLabel.textContent = preset.secretLabel || 'Secret key';
+        if (selectedProviderName) selectedProviderName.textContent = preset.name;
+        if (selectedProviderSummary) selectedProviderSummary.textContent = preset.summary;
+        if (selectedProviderIcon) selectedProviderIcon.className = 'provider-icon provider-icon-' + presetKey;
+        if (selectedProviderIconFallback) selectedProviderIconFallback.textContent = preset.mark;
+        if (selectedProviderIconImage) {
+          selectedProviderIconImage.hidden = !preset.icon;
+          selectedProviderIconImage.src = preset.icon || '';
+        }
+        if (providerCatalogView) providerCatalogView.hidden = true;
+        if (providerConfigView) providerConfigView.hidden = false;
+        if (providerDialogTitle) providerDialogTitle.textContent = 'Configure ' + preset.name;
+        if (providerDialogDescription) providerDialogDescription.textContent = 'Use the same account ID to update it. Leave an existing secret empty to preserve it.';
+        if (providerID) providerID.focus();
+      };
+
+      document.querySelectorAll('[data-provider-preset]').forEach((button) => {
+        button.addEventListener('click', () => applyProviderPreset(button.getAttribute('data-provider-preset')));
+      });
+      if (providerBack) providerBack.addEventListener('click', showProviderCatalog);
+      if (providerRegion) providerRegion.addEventListener('input', () => {
+        const preset = providerPresets[selectedProviderPreset];
+        if (preset && preset.endpointTemplate && providerEndpoint) providerEndpoint.value = providerEndpointFor(preset);
+      });
+      if (providerReset) providerReset.addEventListener('click', () => {
+        if (selectedProviderPreset) applyProviderPreset(selectedProviderPreset);
+      });
+
       const openButtons = document.querySelectorAll('[data-open-dialog]');
       const closeButtons = document.querySelectorAll('[data-dialog-close]');
 
@@ -1435,6 +2384,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
         button.addEventListener('click', () => {
           const dialog = document.getElementById(button.getAttribute('data-open-dialog'));
           if (!dialog) return;
+          if (dialog.id === 'provider-dialog') showProviderCatalog();
           if (typeof dialog.showModal === 'function') {
             dialog.showModal();
           } else {
@@ -1482,7 +2432,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
       const deleteObjectConfirmation = document.getElementById('delete-object-confirmation');
       const deleteObjectSubmit = document.getElementById('delete-object-submit');
       let pendingDeleteKey = '';
-      const deletePhrase = 'Eliminar permanentemente';
+      const deletePhrase = 'Delete permanently';
 
       const humanBytes = (bytes) => {
         const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
@@ -1712,7 +2662,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
             if (!response.ok) throw new Error(payload.detail || raw || 'Could not delete object');
             if (deleteObjectDialog && typeof deleteObjectDialog.close === 'function') deleteObjectDialog.close();
             setPublicURL('');
-            showObjectStatus('success', 'Deleted ' + pendingDeleteKey + ' permanently.');
+            showObjectStatus('success', 'Deleted ' + pendingDeleteKey + ' using the bucket protection policy.');
             pendingDeleteKey = '';
             await loadObjects();
           } catch (error) {
@@ -1735,7 +2685,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
       const migrationRows = document.getElementById('migration-job-rows');
       const migrationTable = document.getElementById('migration-jobs-table');
       const migrationEmpty = document.getElementById('migration-jobs-empty');
-      const migrationPhrase = 'Migrar permanentemente';
+      const migrationPhrase = 'Migrate permanently';
 
       const showMigrationStatus = (kind, message) => {
         if (!migrationStatus) return;
@@ -1882,6 +2832,177 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
       if (migrationRows) {
         window.setInterval(refreshMigrationJobs, 3000);
       }
+
+      const setNotice = (element, kind, message) => {
+        if (!element) return;
+        element.hidden = false;
+        element.className = 'notice' + (kind ? ' ' + kind : '');
+        element.textContent = message;
+      };
+      const readProblem = async (response, fallback) => {
+        const raw = await response.text();
+        let payload = {};
+        try { payload = raw ? JSON.parse(raw) : {}; } catch (_) {}
+        if (!response.ok) throw new Error(payload.detail || raw || fallback);
+        return payload;
+      };
+
+      document.querySelectorAll('[data-test-provider]').forEach((testButton) => {
+        testButton.addEventListener('click', async () => {
+          const original = testButton.textContent;
+          testButton.disabled = true;
+          testButton.textContent = 'Testing…';
+          try {
+            const response = await fetch('/admin/api/providers/' + encodeURIComponent(testButton.dataset.testProvider) + '/test', { method: 'POST', headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+            const payload = await readProblem(response, 'Connection test failed');
+            testButton.textContent = payload.status === 'healthy' ? 'Healthy' : payload.status;
+            testButton.title = payload.message || '';
+          } catch (error) {
+            testButton.textContent = 'Failed';
+            testButton.title = error.message || 'Connection test failed';
+          } finally {
+            window.setTimeout(() => { testButton.textContent = original; testButton.disabled = false; }, 4000);
+          }
+        });
+      });
+
+      const inventoryForm = document.getElementById('inventory-form');
+      const inventoryProvider = document.getElementById('inventory-provider');
+      const inventoryBucket = document.getElementById('inventory-bucket');
+      const inventoryLogicalBucket = document.getElementById('inventory-logical-bucket');
+      const inventoryPrefix = document.getElementById('inventory-prefix');
+      const inventoryMode = document.getElementById('inventory-mode');
+      const inventoryStatus = document.getElementById('inventory-status');
+      const inventoryOptions = document.getElementById('inventory-bucket-options');
+      document.querySelectorAll('[data-inventory-provider]').forEach((importButton) => importButton.addEventListener('click', () => {
+        if (inventoryProvider) inventoryProvider.value = importButton.dataset.inventoryProvider || '';
+      }));
+      const testInventoryProvider = async () => {
+        if (!inventoryProvider || !inventoryProvider.value) return;
+        setNotice(inventoryStatus, '', 'Testing provider connection…');
+        try {
+          const response = await fetch('/admin/api/providers/' + encodeURIComponent(inventoryProvider.value) + '/test', { method: 'POST', headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+          const payload = await readProblem(response, 'Connection test failed');
+          setNotice(inventoryStatus, payload.status === 'healthy' ? 'success' : '', (payload.status || 'unknown') + ': ' + (payload.message || 'connection completed'));
+        } catch (error) { setNotice(inventoryStatus, 'error', error.message || 'Connection test failed'); }
+      };
+      const inventoryTest = document.getElementById('inventory-test');
+      if (inventoryTest) inventoryTest.addEventListener('click', testInventoryProvider);
+      const inventoryDiscover = document.getElementById('inventory-discover');
+      if (inventoryDiscover) inventoryDiscover.addEventListener('click', async () => {
+        if (!inventoryProvider || !inventoryProvider.value) return;
+        setNotice(inventoryStatus, '', 'Discovering remote buckets…');
+        try {
+          const response = await fetch('/admin/api/providers/' + encodeURIComponent(inventoryProvider.value) + '/buckets', { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+          const payload = await readProblem(response, 'Bucket discovery failed');
+          if (inventoryOptions) {
+            inventoryOptions.textContent = '';
+            (payload.buckets || []).forEach((bucket) => { const option = document.createElement('option'); option.value = bucket.name; inventoryOptions.appendChild(option); });
+          }
+          if (inventoryBucket && payload.buckets && payload.buckets.length === 1) inventoryBucket.value = payload.buckets[0].name;
+          setNotice(inventoryStatus, 'success', 'Found ' + ((payload.buckets || []).length) + ' remote bucket(s).');
+        } catch (error) { setNotice(inventoryStatus, 'error', error.message || 'Bucket discovery failed'); }
+      });
+      if (inventoryForm) inventoryForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        setNotice(inventoryStatus, '', 'Creating durable inventory job…');
+        try {
+          const response = await fetch('/admin/api/inventory-jobs', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ provider_account_id: inventoryProvider ? inventoryProvider.value : '', bucket: inventoryLogicalBucket ? inventoryLogicalBucket.value : '', remote_bucket: inventoryBucket ? inventoryBucket.value : '', prefix: inventoryPrefix ? inventoryPrefix.value : '', mode: inventoryMode ? inventoryMode.value : 'import' }) });
+          const payload = await readProblem(response, 'Could not create inventory job');
+          setNotice(inventoryStatus, 'success', 'Inventory job ' + payload.id + ' started. Reload to see progress.');
+        } catch (error) { setNotice(inventoryStatus, 'error', error.message || 'Could not create inventory job'); }
+      });
+
+      const credentialDialog = document.getElementById('credential-dialog');
+      const credentialForm = document.getElementById('credential-form');
+      const credentialStatus = document.getElementById('credential-status');
+      const credentialSecretPanel = document.getElementById('credential-secret-panel');
+      const credentialSecret = document.getElementById('credential-secret');
+      const csvValues = (value) => String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+      const revealCredential = (payload, rotated) => {
+        if (credentialSecretPanel) credentialSecretPanel.hidden = false;
+        if (credentialSecret) credentialSecret.value = 'AWS_ACCESS_KEY_ID=' + payload.credential.access_key + '\nAWS_SECRET_ACCESS_KEY=' + payload.secret_key;
+        setNotice(credentialStatus, 'success', rotated ? 'Key rotated. The previous secret no longer works.' : 'Key created. Copy this secret now; it will not be shown again.');
+      };
+      if (credentialForm) credentialForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const expiresInput = document.getElementById('credential-expires');
+        let expiresAt = '';
+        if (expiresInput && expiresInput.value) expiresAt = new Date(expiresInput.value).toISOString();
+        setNotice(credentialStatus, '', 'Creating key…');
+        try {
+          const response = await fetch('/admin/api/access-credentials', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ name: document.getElementById('credential-name').value, role: document.getElementById('credential-role').value, bucket_patterns: csvValues(document.getElementById('credential-buckets').value), prefix_patterns: csvValues(document.getElementById('credential-prefixes').value), enabled: document.getElementById('credential-enabled').checked, expires_at: expiresAt }) });
+          revealCredential(await readProblem(response, 'Could not create key'), false);
+        } catch (error) { setNotice(credentialStatus, 'error', error.message || 'Could not create key'); }
+      });
+      document.querySelectorAll('[data-rotate-credential]').forEach((rotateButton) => rotateButton.addEventListener('click', async () => {
+        if (!window.confirm('Rotate this key now? The current secret will stop working immediately.')) return;
+        try {
+          const response = await fetch('/admin/api/access-credentials/' + encodeURIComponent(rotateButton.dataset.rotateCredential) + '/rotate', { method: 'POST', headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+          const payload = await readProblem(response, 'Could not rotate key');
+          if (credentialDialog && typeof credentialDialog.showModal === 'function' && !credentialDialog.open) credentialDialog.showModal();
+          revealCredential(payload, true);
+        } catch (error) { window.alert(error.message || 'Could not rotate key'); }
+      }));
+      const credentialCopy = document.getElementById('credential-copy');
+      if (credentialCopy) credentialCopy.addEventListener('click', async () => {
+        if (!credentialSecret || !credentialSecret.value) return;
+        try { await navigator.clipboard.writeText(credentialSecret.value); setNotice(credentialStatus, 'success', 'Credentials copied.'); } catch (_) { credentialSecret.select(); }
+      });
+
+      document.querySelectorAll('[data-restore-trash]').forEach((restoreButton) => restoreButton.addEventListener('click', async () => {
+        restoreButton.disabled = true;
+        try {
+          const response = await fetch('/admin/api/trash/' + encodeURIComponent(restoreButton.dataset.restoreTrash) + '/restore', { method: 'POST', headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+          await readProblem(response, 'Could not restore object');
+          window.location.reload();
+        } catch (error) { restoreButton.disabled = false; window.alert(error.message || 'Could not restore object'); }
+      }));
+      const lifecycleRun = document.getElementById('lifecycle-run');
+      if (lifecycleRun) lifecycleRun.addEventListener('click', async () => {
+        lifecycleRun.disabled = true;
+        lifecycleRun.textContent = 'Running…';
+        try {
+          const response = await fetch('/admin/api/lifecycle/run', { method: 'POST', headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+          const payload = await readProblem(response, 'Lifecycle run failed');
+          lifecycleRun.textContent = 'Expired ' + payload.expired_objects + ' · purged ' + payload.purged_trash;
+        } catch (error) { lifecycleRun.textContent = 'Run failed'; lifecycleRun.title = error.message || ''; }
+        window.setTimeout(() => { lifecycleRun.disabled = false; lifecycleRun.textContent = 'Run lifecycle'; }, 5000);
+      });
+
+      const repairForm = document.getElementById('repair-form');
+      const repairStatus = document.getElementById('repair-status');
+      if (repairForm) repairForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        setNotice(repairStatus, '', 'Creating durable integrity scan…');
+        try {
+          const response = await fetch('/admin/api/repair-jobs', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ bucket: document.getElementById('repair-bucket').value, prefix: document.getElementById('repair-prefix').value }) });
+          const payload = await readProblem(response, 'Could not create repair scan');
+          setNotice(repairStatus, 'success', 'Repair scan ' + payload.id + ' started. Reload to see progress.');
+        } catch (error) { setNotice(repairStatus, 'error', error.message || 'Could not create repair scan'); }
+      });
+
+      const placementForm = document.getElementById('placement-form');
+      const placementStatus = document.getElementById('placement-status');
+      const placementResults = document.getElementById('placement-results');
+      if (placementForm) placementForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        setNotice(placementStatus, '', 'Calculating placement…');
+        const params = new URLSearchParams({ bucket: document.getElementById('placement-bucket').value, size: document.getElementById('placement-size').value });
+        try {
+          const response = await fetch('/admin/api/placement-plan?' + params.toString(), { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+          const payload = await readProblem(response, 'Placement simulation failed');
+          if (placementResults) {
+            placementResults.textContent = '';
+            const table = document.createElement('table'); table.className = 'table';
+            const head = document.createElement('thead'); head.innerHTML = '<tr><th>Provider</th><th>Eligible</th><th>Remaining</th><th>Projected / month</th></tr>'; table.appendChild(head);
+            const body = document.createElement('tbody');
+            (payload.providers || []).forEach((provider) => { const row = document.createElement('tr'); [provider.provider_name + (provider.recommended ? ' · recommended' : ''), provider.eligible ? 'yes' : provider.reason, humanBytes(provider.remaining_bytes), '$' + Number(provider.projected_monthly_cost || 0).toFixed(2)].forEach((value) => { const cell = document.createElement('td'); cell.textContent = value; row.appendChild(cell); }); body.appendChild(row); });
+            table.appendChild(body); placementResults.appendChild(table);
+          }
+          setNotice(placementStatus, 'success', 'Placement simulation complete. No data was written.');
+        } catch (error) { setNotice(placementStatus, 'error', error.message || 'Placement simulation failed'); }
+      });
 
       const form = document.getElementById('admin-upload-form');
       const status = document.getElementById('upload-status');

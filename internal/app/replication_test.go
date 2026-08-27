@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +30,7 @@ func TestPutObjectReplicatesToSelectedBucketProviders(t *testing.T) {
 				Bucket:        "images",
 				CapacityBytes: 1024 * 1024,
 				Priority:      1,
-				Enabled:       boolPtr(true),
+				Enabled:       new(true),
 				Settings:      map[string]string{"path": filepath.Join(dataDir, "primary")},
 			},
 			{
@@ -39,7 +40,7 @@ func TestPutObjectReplicatesToSelectedBucketProviders(t *testing.T) {
 				Bucket:        "images",
 				CapacityBytes: 1024 * 1024,
 				Priority:      100,
-				Enabled:       boolPtr(true),
+				Enabled:       new(true),
 				Settings:      map[string]string{"path": filepath.Join(dataDir, "replica")},
 			},
 		},
@@ -51,7 +52,11 @@ func TestPutObjectReplicatesToSelectedBucketProviders(t *testing.T) {
 		svc.cancelWorkers()
 		svc.workerWG.Wait()
 	}
-	defer svc.Close()
+	t.Cleanup(func() {
+		if err := svc.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 
 	obj, err := svc.PutObject(context.Background(), domain.PutObjectInput{Bucket: "images", Key: "photos/demo.txt", Size: int64(len("replicated")), ContentType: "text/plain"}, strings.NewReader("replicated"))
 	if err != nil {
@@ -90,6 +95,44 @@ func TestPutObjectReplicatesToSelectedBucketProviders(t *testing.T) {
 	}
 	if string(data) != "replicated" {
 		t.Fatalf("replica data = %q", string(data))
+	}
+	if err := os.Remove(filepath.Join(dataDir, "primary", "images", "photos", "demo.txt")); err != nil {
+		t.Fatalf("remove primary fixture: %v", err)
+	}
+	body, served, err := svc.GetObject(context.Background(), "images", "photos/demo.txt")
+	if err != nil {
+		t.Fatalf("GetObject() with unavailable primary error = %v", err)
+	}
+	fallbackData, readErr := io.ReadAll(body)
+	_ = body.Close()
+	if readErr != nil || string(fallbackData) != "replicated" || served.ProviderAccountID != "local-replica" {
+		t.Fatalf("replica fallback body=%q object=%+v readErr=%v", fallbackData, served, readErr)
+	}
+	head, err := svc.HeadObject(context.Background(), "images", "photos/demo.txt")
+	if err != nil || head.ProviderAccountID != "local-replica" || head.Size != int64(len("replicated")) {
+		t.Fatalf("HeadObject() replica fallback = %+v, %v", head, err)
+	}
+	repair, err := svc.RepairObject(context.Background(), "images", "photos/demo.txt")
+	if err != nil || !repair.Repaired {
+		t.Fatalf("RepairObject() = %+v, %v", repair, err)
+	}
+	primaryData, err := os.ReadFile(filepath.Join(dataDir, "primary", "images", "photos", "demo.txt"))
+	if err != nil || string(primaryData) != "replicated" {
+		t.Fatalf("repaired primary=%q err=%v", primaryData, err)
+	}
+	if err := os.Remove(filepath.Join(dataDir, "primary", "images", "photos", "demo.txt")); err != nil {
+		t.Fatalf("remove repaired primary fixture: %v", err)
+	}
+	job, err := svc.CreateRepairJob(context.Background(), "images", "photos/")
+	if err != nil {
+		t.Fatalf("CreateRepairJob() error = %v", err)
+	}
+	if err := svc.RunRepairJob(context.Background(), job.ID); err != nil {
+		t.Fatalf("RunRepairJob() error = %v", err)
+	}
+	job, err = svc.Store.GetRepairJob(context.Background(), job.ID)
+	if err != nil || job.Status != domain.RepairStatusCompleted || job.CheckedObjects != 1 || job.RepairedObjects != 1 || job.FailedObjects != 0 {
+		t.Fatalf("repair job=%+v err=%v", job, err)
 	}
 
 	if err := svc.DeleteObject(context.Background(), "images", "photos/demo.txt"); err != nil {

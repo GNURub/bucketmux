@@ -1,6 +1,10 @@
 server:
   addr: ":8080"
   data_dir: "/data"
+  multipart_staging_dir: "/multipart"
+  max_upload_bytes: 5368709120
+  max_multipart_part_bytes: 536870912
+  max_admin_body_bytes: 1048576
   public_base_url: "http://localhost:8080"
   master_key: "change-me-use-MASTER_KEY-env"
 

@@ -11,8 +11,8 @@
 | Open DB | `store.go` | `OpenConfig`, `OpenSQLite`, `OpenPostgres`. |
 | Schema migrations | `store.go:migrate` | Creates tables/indexes and adds legacy columns. |
 | SQL dialect handling | `store.go:rebind` | `?` placeholders become `$N` for Postgres. |
-| Provider/bucket/object CRUD | `store.go` | `UpsertProvider`, `UpsertBucket`, `PutObject`, etc. |
-| Worker claims | `store.go` | `ClaimNextObjectReplica`, `ClaimNextMigrationJob`. |
+| Provider/bucket/object CRUD | `store.go` | `UpsertProvider`, `UpsertBucket`, `PutObject`; `GetObjectWithProvider` is the joined gateway hot path. |
+| Worker claims | `store.go` | Atomic hook/replica/migration claims plus stale-running recovery. |
 | Multipart records | `store.go` | `CreateMultipartUpload`, `UpsertMultipartPart`, cleanup. |
 | Hooks/audit/usage | `store.go` | Hook deliveries, audit log, provider usage. |
 
@@ -26,7 +26,9 @@
 - JSON/array/map fields are TEXT columns ending in `_json`.
 - Encrypted secrets use `secret_encrypted` or `headers_encrypted`; encryption happens in `app`, not store.
 - Not-found reads return exported sentinel `ErrNotFound`.
+- SQLite defaults to a bounded 10-open/10-idle pool; keep it configurable because unlimited connections amplify single-writer lock contention.
 - Store-side caps matter: object listing caps at 1000; hook deliveries cap at 200; migration lists cap at 100.
+- Durable workers claim with conditional `pending -> running` updates. Every new running state needs a conditional heartbeat and a stale recovery query.
 
 ## ANTI-PATTERNS
 

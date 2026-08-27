@@ -1,0 +1,17 @@
+{
+  "name": "bucketmux-uppy-compatibility-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild fixture.js fetch-fixture.js --bundle --format=esm --target=chrome120 --outdir=dist"
+  },
+  "dependencies": {
+    "@uppy/aws-s3": "6.0.0",
+    "@uppy/core": "6.0.0"
+  },
+  "devDependencies": {
+    "@playwright/cli": "0.1.18",
+    "esbuild": "0.28.2"
+  }
+}

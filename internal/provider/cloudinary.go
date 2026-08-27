@@ -31,7 +31,7 @@ func (a *CloudinaryAdapter) Put(ctx context.Context, account domain.ProviderAcco
 	if cloudName == "" {
 		return domain.StoredObject{}, fmt.Errorf("cloudinary provider %s requires settings.cloud_name", account.ID)
 	}
-	publicID := strings.Trim(strings.TrimPrefix(input.Key, "/"), "/")
+	publicID := strings.Trim(strings.TrimPrefix(input.StorageKey(), "/"), "/")
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	params := map[string]string{"public_id": publicID, "timestamp": timestamp, "overwrite": "true"}
 	signature := signCloudinary(params, account.SecretKey)
@@ -41,7 +41,7 @@ func (a *CloudinaryAdapter) Put(ctx context.Context, account domain.ProviderAcco
 	writeErr := make(chan error, 1)
 	go func() {
 		defer close(writeErr)
-		defer pipeWriter.Close()
+		defer func() { _ = pipeWriter.Close() }()
 		if err := writer.WriteField("api_key", account.AccessKey); err != nil {
 			writeErr <- err
 			return
@@ -88,7 +88,7 @@ func (a *CloudinaryAdapter) Put(ctx context.Context, account domain.ProviderAcco
 	if err != nil {
 		return domain.StoredObject{}, fmt.Errorf("upload cloudinary object: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 		return domain.StoredObject{}, fmt.Errorf("upload cloudinary object failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
@@ -128,7 +128,7 @@ func (a *CloudinaryAdapter) Get(ctx context.Context, account domain.ProviderAcco
 		return nil, obj, err
 	}
 	if res.StatusCode != http.StatusOK {
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		return nil, obj, fmt.Errorf("get cloudinary object failed: status=%d", res.StatusCode)
 	}
 	return res.Body, obj, nil
@@ -146,7 +146,7 @@ func (a *CloudinaryAdapter) Head(ctx context.Context, account domain.ProviderAcc
 	if err != nil {
 		return obj, err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
 		return obj, fmt.Errorf("head cloudinary object failed: status=%d", res.StatusCode)
 	}
@@ -174,7 +174,7 @@ func (a *CloudinaryAdapter) Delete(ctx context.Context, account domain.ProviderA
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		return fmt.Errorf("delete cloudinary object failed: status=%d", res.StatusCode)
 	}
@@ -200,7 +200,7 @@ func (a *CloudinaryAdapter) Health(ctx context.Context, account domain.ProviderA
 	if err != nil {
 		return unhealthy(account, started, "cloudinary api probe failed: %v", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	switch {
 	case res.StatusCode >= 200 && res.StatusCode < 300:
 		return healthy(account, started, "Cloudinary API responded")

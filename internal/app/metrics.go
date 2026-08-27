@@ -31,7 +31,43 @@ func (s *Service) PrometheusMetrics(ctx context.Context) string {
 	}
 	writeStatusCounts(&b, "bucketmux_migration_jobs", "Migration jobs by status.", migrationStatusCounts(ctx, s))
 	writeStatusCounts(&b, "bucketmux_hook_deliveries", "Webhook deliveries by status.", hookDeliveryStatusCounts(ctx, s))
+	writeStatusCounts(&b, "bucketmux_inventory_jobs", "Inventory jobs by status.", inventoryStatusCounts(ctx, s))
+	writeStatusCounts(&b, "bucketmux_repair_jobs", "Integrity scan and repair jobs by status.", repairStatusCounts(ctx, s))
+	trash, _ := s.Store.ListTrashObjects(ctx, 1000)
+	b.WriteString("# HELP bucketmux_trash_objects Objects retained in recoverable trash.\n")
+	b.WriteString("# TYPE bucketmux_trash_objects gauge\n")
+	fmt.Fprintf(&b, "bucketmux_trash_objects %d\n", len(trash))
+	b.WriteString("# HELP bucketmux_worker_failures_total Durable worker infrastructure failures.\n")
+	b.WriteString("# TYPE bucketmux_worker_failures_total counter\n")
+	b.WriteString("# HELP bucketmux_worker_last_success_timestamp_seconds Last successful durable work completion.\n")
+	b.WriteString("# TYPE bucketmux_worker_last_success_timestamp_seconds gauge\n")
+	for _, worker := range s.workerRuntimeSnapshots() {
+		fmt.Fprintf(&b, "bucketmux_worker_failures_total{worker=%q} %d\n", worker.Name, worker.Failures)
+		lastSuccess := int64(0)
+		if !worker.LastSuccess.IsZero() {
+			lastSuccess = worker.LastSuccess.Unix()
+		}
+		fmt.Fprintf(&b, "bucketmux_worker_last_success_timestamp_seconds{worker=%q} %d\n", worker.Name, lastSuccess)
+	}
 	return b.String()
+}
+
+func repairStatusCounts(ctx context.Context, s *Service) map[string]int {
+	jobs, _ := s.Store.ListRepairJobs(ctx, 100)
+	counts := map[string]int{}
+	for _, job := range jobs {
+		counts[job.Status]++
+	}
+	return counts
+}
+
+func inventoryStatusCounts(ctx context.Context, s *Service) map[string]int {
+	jobs, _ := s.Store.ListInventoryJobs(ctx, 100)
+	counts := map[string]int{}
+	for _, job := range jobs {
+		counts[job.Status]++
+	}
+	return counts
 }
 
 func migrationStatusCounts(ctx context.Context, s *Service) map[string]int {

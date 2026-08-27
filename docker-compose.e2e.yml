@@ -1,0 +1,14 @@
+services:
+  ministack:
+    image: ministackorg/ministack:1.5.2
+    environment:
+      LOG_LEVEL: WARNING
+      S3_PERSIST: "0"
+    ports:
+      - "127.0.0.1:${MINISTACK_PORT:-4566}:4566"
+    healthcheck:
+      test: ["CMD", "awslocal", "s3api", "list-buckets"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s

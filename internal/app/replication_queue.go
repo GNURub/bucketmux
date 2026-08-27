@@ -15,40 +15,46 @@ const (
 	replicaStatusFailed    = "failed"
 )
 
+const replicationWorkerInterval = 2 * time.Second
+const replicationHeartbeatInterval = 30 * time.Second
+const replicationWorkStaleAfter = 15 * time.Minute
+
 func (s *Service) enqueueObjectReplicas(ctx context.Context, primary domain.ObjectRecord, targets []string) error {
 	for _, providerID := range targets {
 		if err := s.Store.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: primary.Bucket, Key: primary.Key, ProviderAccountID: providerID, Size: primary.Size, Status: replicaStatusPending}); err != nil {
 			return err
 		}
 	}
+	signalWorker(s.replicationWake)
 	return nil
 }
 
 func (s *Service) StartReplicationWorker(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		lease, ok := s.tryWorkerLease(ctx, "replication")
-		if ok {
+	s.runDurableWorker(ctx, durableWorker{
+		name:              "replication",
+		interval:          replicationWorkerInterval,
+		heartbeatInterval: replicationHeartbeatInterval,
+		staleAfter:        replicationWorkStaleAfter,
+		wake:              s.replicationWake,
+		recover: func(ctx context.Context, cutoff time.Time) error {
+			_, err := s.Store.RecoverStaleObjectReplicas(ctx, cutoff)
+			return err
+		},
+		claim: func(ctx context.Context) (durableWorkItem, bool, error) {
 			replica, claimed, err := s.Store.ClaimNextObjectReplica(ctx)
-			if err == nil && claimed {
-				_ = s.RunObjectReplication(ctx, replica.Bucket, replica.Key, replica.ProviderAccountID)
-				_ = lease.Release(ctx)
-				continue
+			if err != nil || !claimed {
+				return durableWorkItem{}, claimed, err
 			}
-			_ = lease.Release(ctx)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
+			return durableWorkItem{
+				run: func(ctx context.Context) error {
+					return s.RunObjectReplication(ctx, replica.Bucket, replica.Key, replica.ProviderAccountID)
+				},
+				heartbeat: func(ctx context.Context) error {
+					return s.Store.TouchObjectReplica(ctx, replica.Bucket, replica.Key, replica.ProviderAccountID)
+				},
+			}, true, nil
+		},
+	})
 }
 
 func (s *Service) RunObjectReplication(ctx context.Context, bucket, key, providerID string) error {
@@ -73,7 +79,7 @@ func (s *Service) RunObjectReplication(ctx context.Context, bucket, key, provide
 	if err != nil {
 		return s.failObjectReplica(ctx, obj, providerID, err)
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 	stored, err := s.putOnProvider(ctx, account, domain.PutObjectInput{Bucket: obj.Bucket, Key: obj.Key, Size: obj.Size, ContentType: obj.ContentType}, body)
 	if err != nil {
 		return s.failObjectReplica(ctx, obj, providerID, err)
