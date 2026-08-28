@@ -24,13 +24,15 @@ services:
       start_period: 5s
 
   postgres:
-    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    image: pgvector/pgvector:0.8.6-pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
     environment:
       POSTGRES_DB: bucketmux
       POSTGRES_USER: bucketmux
       POSTGRES_PASSWORD: multi-instance-postgres
     volumes:
       - multi-instance-postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${MULTI_POSTGRES_PORT:-15432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bucketmux -d bucketmux"]
       interval: 2s
@@ -74,6 +76,7 @@ services:
       POSTGRES_DSN: postgres://bucketmux:multi-instance-postgres@postgres:5432/bucketmux?sslmode=disable
       POSTGRES_MAX_OPEN_CONNS: 20
       POSTGRES_MAX_IDLE_CONNS: 10
+      VECTOR_SEARCH_BACKEND: pgvector
       COORDINATION_KIND: redis
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: multi-instance-redis

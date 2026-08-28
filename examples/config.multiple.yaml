@@ -14,6 +14,13 @@ store:
     dsn: "postgres://bucketmux:bucketmux@postgres:5432/bucketmux?sslmode=disable"
     max_open_conns: 25
     max_idle_conns: 10
+  vector_search:
+    backend: "pgvector"
+    hnsw_m: 16
+    ef_construction: 64
+    ef_search: 100
+    max_scan_tuples: 20000
+    max_profiles: 64
 
 coordination:
   kind: "redis"

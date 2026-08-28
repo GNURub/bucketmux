@@ -72,6 +72,24 @@ func TestPlacementRouterChoose(t *testing.T) {
 			},
 			wantID: "cheap",
 		},
+		{
+			name:      "includes atomic reservations in available capacity",
+			inputSize: 20,
+			providers: []domain.ProviderAccount{
+				{ID: "reserved", Priority: 1, CapacityBytes: 100, UsedBytes: 60, ReservedBytes: 30, Enabled: true},
+				{ID: "free", Priority: 2, CapacityBytes: 100, Enabled: true},
+			},
+			wantID: "free",
+		},
+		{
+			name:      "skips provider blocked by credentials",
+			inputSize: 1,
+			providers: []domain.ProviderAccount{
+				{ID: "expired", Priority: 1, Enabled: true, AvailabilityStatus: "credentials"},
+				{ID: "ready", Priority: 2, Enabled: true},
+			},
+			wantID: "ready",
+		},
 	}
 
 	for _, tt := range tests {

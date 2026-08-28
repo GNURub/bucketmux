@@ -38,7 +38,7 @@ func (s *Service) RepairObject(ctx context.Context, bucket, key string) (RepairR
 		return RepairResult{}, fmt.Errorf("no readable replica is available: %w", err)
 	}
 	defer func() { _ = body.Close() }()
-	stored, err := s.putOnProvider(ctx, account, domain.PutObjectInput{Bucket: object.Bucket, Key: object.Key, RemoteKey: object.RemoteKey, Size: object.Size, ContentType: object.ContentType, Metadata: object.Metadata, Tags: object.Tags}, body)
+	stored, err := s.putOnProvider(ctx, account, domain.PutObjectInput{Bucket: object.Bucket, Key: object.Key, RemoteKey: object.RemoteKey, Size: object.Size, ContentType: object.ContentType, Metadata: object.Metadata, Tags: object.Tags, ChecksumSHA256: object.ChecksumSHA256}, body)
 	if err != nil {
 		return RepairResult{}, fmt.Errorf("restore primary object: %w", err)
 	}

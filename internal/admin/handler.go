@@ -65,6 +65,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		limit := h.svc.Config.Server.MaxAdminBodyBytes
 		if path == "/upload" {
 			limit = h.svc.Config.Server.MaxUploadBytes + (1 << 20)
+		} else if path == "/api/wasm-plugins" || path == "/api/wasm-plugins/validate" || path == "/api/declarative/apply" {
+			pluginLimit := h.svc.Config.WASMPlugins.MaxModuleBytes*4/3 + (1 << 20)
+			if pluginLimit > limit {
+				limit = pluginLimit
+			}
 		}
 		if r.ContentLength > limit {
 			writeProblem(w, http.StatusRequestEntityTooLarge, "request-too-large", "Request body exceeds the configured limit")
@@ -91,6 +96,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.createBucketFromForm(w, r)
 	case path == "/upload" && r.Method == http.MethodPost:
 		h.uploadObjectFromForm(w, r)
+	case path == "/partials/provider-catalog" && r.Method == http.MethodGet:
+		h.providerCatalog(w, r)
 	case path == "/api/providers":
 		h.providers(w, r)
 	case strings.HasPrefix(path, "/api/providers/") && strings.HasSuffix(path, "/test"):
@@ -99,6 +106,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/api/providers/") && strings.HasSuffix(path, "/buckets"):
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api/providers/"), "/buckets")
 		h.discoverProviderBuckets(w, r, id)
+	case strings.HasPrefix(path, "/api/providers/") && strings.HasSuffix(path, "/quota/reconcile"):
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api/providers/"), "/quota/reconcile")
+		h.reconcileProviderQuota(w, r, id)
 	case strings.HasPrefix(path, "/api/providers/"):
 		h.providerByID(w, r, strings.TrimPrefix(path, "/api/providers/"))
 	case path == "/api/inventory-jobs":
@@ -137,6 +147,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.usage(w, r)
 	case path == "/api/provider-health":
 		h.providerHealth(w, r)
+	case path == "/api/provider-quotas":
+		h.providerQuotas(w, r)
+	case path == "/api/alerts":
+		h.alerts(w, r)
+	case path == "/api/wasm-plugins/validate":
+		h.validateWASMPlugin(w, r)
+	case path == "/api/wasm-plugins":
+		h.wasmPlugins(w, r)
+	case strings.HasPrefix(path, "/api/wasm-plugins/"):
+		h.wasmPluginByID(w, r, strings.TrimPrefix(path, "/api/wasm-plugins/"))
+	case path == "/api/wasm-plugin-jobs":
+		h.wasmPluginJobs(w, r)
+	case path == "/api/embeddings/capabilities":
+		h.embeddingCapabilities(w, r)
+	case path == "/api/embeddings":
+		h.embeddings(w, r)
+	case path == "/api/embeddings/search":
+		h.searchEmbeddings(w, r)
 	case path == "/api/objects":
 		h.objects(w, r)
 	case path == "/api/objects/presign":
@@ -266,6 +294,10 @@ func (h *Handler) index(w http.ResponseWriter, r *http.Request, message string) 
 		return
 	}
 	costOptimizations, _ := h.svc.CostOptimizations(r.Context())
+	providerQuotas, _ := h.svc.ListProviderQuotas(r.Context())
+	alerts, _ := h.svc.Store.ListAlerts(r.Context(), domain.AlertStatusOpen, 25)
+	wasmPlugins, _ := h.svc.Store.ListWASMPlugins(r.Context(), false)
+	wasmPluginJobs, _ := h.svc.Store.ListWASMPluginJobs(r.Context(), 25)
 	providerBrands := make(map[string]string, len(providers))
 	providerNames := make(map[string]string, len(providers))
 	for _, account := range providers {
@@ -273,7 +305,14 @@ func (h *Handler) index(w http.ResponseWriter, r *http.Request, message string) 
 		providerNames[account.ID] = account.Name
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = indexTemplate.Execute(w, adminPageData{Providers: providers, ProviderBrands: providerBrands, ProviderNames: providerNames, Buckets: buckets, Usage: usage, Hooks: hooks, HookDeliveries: deliveries, ProviderHealth: health, MigrationJobs: migrations, AuditEvents: auditEvents, AccessCredentials: accessCredentials, InventoryJobs: inventoryJobs, RepairJobs: repairJobs, TrashObjects: trashObjects, CostOptimizations: costOptimizations, OIDCEnabled: h.svc.Config.Admin.OIDC.Enabled, TotalBytes: totalUsageBytes(usage), Message: message})
+	_ = indexTemplate.Execute(w, adminPageData{Providers: providers, ProviderBrands: providerBrands, ProviderNames: providerNames, Buckets: buckets, Usage: usage, Hooks: hooks, HookDeliveries: deliveries, ProviderHealth: health, MigrationJobs: migrations, AuditEvents: auditEvents, AccessCredentials: accessCredentials, InventoryJobs: inventoryJobs, RepairJobs: repairJobs, TrashObjects: trashObjects, CostOptimizations: costOptimizations, ProviderPresets: providerCatalog, ProviderQuotas: providerQuotas, Alerts: alerts, WASMPlugins: wasmPlugins, WASMPluginJobs: wasmPluginJobs, OIDCEnabled: h.svc.Config.Admin.OIDC.Enabled, TotalBytes: totalUsageBytes(usage), Message: message})
+}
+
+func (h *Handler) providerCatalog(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := indexTemplate.ExecuteTemplate(w, "providerCatalog", filterProviderCatalog(r.URL.Query().Get("q"))); err != nil {
+		writeProblem(w, http.StatusInternalServerError, "template-error", err.Error())
+	}
 }
 
 func (h *Handler) uploadObjectFromForm(w http.ResponseWriter, r *http.Request) {
@@ -368,6 +407,15 @@ func (h *Handler) createProviderFromForm(w http.ResponseWriter, r *http.Request)
 	}
 	if minFree := strings.TrimSpace(r.FormValue("settings_min_free_bytes")); minFree != "" {
 		settings["min_free_bytes"] = minFree
+	}
+	if quotaMargin := strings.TrimSpace(r.FormValue("settings_quota_margin_bytes")); quotaMargin != "" {
+		settings["quota_margin_bytes"] = quotaMargin
+	}
+	if monthlyQuota := strings.TrimSpace(r.FormValue("settings_monthly_upload_quota_bytes")); monthlyQuota != "" {
+		settings["monthly_upload_quota_bytes"] = monthlyQuota
+	}
+	if alertThreshold := strings.TrimSpace(r.FormValue("settings_quota_alert_threshold_percent")); alertThreshold != "" {
+		settings["quota_alert_threshold_percent"] = alertThreshold
 	}
 	account := domain.ProviderAccount{
 		ID:            strings.TrimSpace(r.FormValue("id")),
@@ -538,6 +586,45 @@ func (h *Handler) discoverProviderBuckets(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"provider_account_id": id, "buckets": buckets})
+}
+
+func (h *Handler) reconcileProviderQuota(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	quota, err := h.svc.ReconcileProviderQuota(r.Context(), id)
+	if err != nil {
+		writeProblem(w, http.StatusBadGateway, "quota-reconciliation-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, quota)
+}
+
+func (h *Handler) providerQuotas(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	quotas, err := h.svc.ListProviderQuotas(r.Context())
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "quota-list-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, quotas)
+}
+
+func (h *Handler) alerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "method is not allowed")
+		return
+	}
+	alerts, err := h.svc.Store.ListAlerts(r.Context(), r.URL.Query().Get("status"), 100)
+	if err != nil {
+		writeProblem(w, http.StatusInternalServerError, "alert-list-failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, alerts)
 }
 
 func (h *Handler) inventoryJobs(w http.ResponseWriter, r *http.Request) {
@@ -1249,6 +1336,11 @@ type adminPageData struct {
 	RepairJobs        []domain.RepairJob
 	TrashObjects      []domain.TrashRecord
 	CostOptimizations []app.CostOptimization
+	ProviderPresets   []providerCatalogPreset
+	ProviderQuotas    []domain.ProviderQuota
+	Alerts            []domain.Alert
+	WASMPlugins       []domain.WASMPlugin
+	WASMPluginJobs    []domain.WASMPluginJob
 	OIDCEnabled       bool
 	TotalBytes        int64
 	Message           string
@@ -1262,6 +1354,8 @@ func providerBrand(account domain.ProviderAccount) string {
 		return "cloudinary"
 	case domain.ProviderKindVercelBlob:
 		return "vercel"
+	case domain.ProviderKindAzureBlob:
+		return "azure"
 	case domain.ProviderKindS3Compat:
 		endpoint := strings.ToLower(account.Endpoint)
 		switch {
@@ -1275,6 +1369,18 @@ func providerBrand(account domain.ProviderAccount) string {
 			return "backblaze"
 		case strings.Contains(endpoint, "digitaloceanspaces.com"):
 			return "digitalocean"
+		case strings.Contains(endpoint, "idrivee2.com"):
+			return "idrive"
+		case strings.Contains(endpoint, "objectstorage") && strings.Contains(endpoint, "oraclecloud.com"):
+			return "oci"
+		case strings.Contains(endpoint, "your-objectstorage.com"):
+			return "hetzner"
+		case strings.Contains(endpoint, "scw.cloud"):
+			return "scaleway"
+		case strings.Contains(endpoint, "cloud.ovh.net"):
+			return "ovh"
+		case strings.Contains(endpoint, "linodeobjects.com"):
+			return "akamai"
 		case strings.Contains(endpoint, "wasabisys.com"):
 			return "wasabi"
 		case strings.Contains(endpoint, "minio"):
@@ -1299,6 +1405,20 @@ func providerBrandMark(brand string) string {
 		return "B2"
 	case "digitalocean":
 		return "DO"
+	case "idrive":
+		return "e2"
+	case "azure":
+		return "AZ"
+	case "oci":
+		return "OCI"
+	case "hetzner":
+		return "HZ"
+	case "scaleway":
+		return "SCW"
+	case "ovh":
+		return "OVH"
+	case "akamai":
+		return "AKA"
 	case "wasabi":
 		return "W"
 	case "minio":
@@ -1525,12 +1645,14 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
 	"providerBrandMark": providerBrandMark,
 	"providerIconURL":   providerIconURL,
 }).Parse(`{{define "providerIcon"}}<span class="provider-icon provider-icon-{{.}}" aria-hidden="true"><span class="provider-icon-fallback">{{providerBrandMark .}}</span>{{with providerIconURL .}}<img src="{{.}}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.hidden=true">{{end}}</span>{{end}}
+{{define "providerCatalog"}}{{range .}}<button class="provider-preset" type="button" data-provider-preset="{{.Key}}">{{template "providerIcon" .Brand}}<span class="provider-preset-copy"><strong>{{.Name}}</strong><span>{{.Description}}</span></span></button>{{else}}<p class="empty provider-catalog-empty">No providers match this name.</p>{{end}}{{end}}
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BucketMux admin</title>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js" integrity="sha384-Q+Dky3iHVJOr6wUjQ4ulh6uQ76an/t+ak1+PjMVaxRjbZamFLAG+u9InkfjbsEQf" crossorigin="anonymous" defer></script>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23171717'/%3E%3Cpath d='M10 8h7.5c4 0 6 1.6 6 4.3 0 1.8-.9 3.1-2.7 3.7 2.1.6 3.2 1.9 3.2 3.9 0 2.8-2.2 4.6-6.2 4.6H10V8Zm6.9 6.5c1.7 0 2.5-.6 2.5-1.8 0-1.1-.8-1.7-2.5-1.7h-2.8v3.5h2.8Zm.4 6.9c1.8 0 2.7-.7 2.7-2s-.9-1.9-2.7-1.9h-3.2v3.9h3.2Z' fill='white'/%3E%3C/svg%3E" />
   <style>
     :root{
@@ -1658,7 +1780,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
     @media (max-width:760px){.app-shell{display:block}.workspace{grid-column:auto}.sidebar{transform:translateX(-100%);transition:transform .18s ease;box-shadow:var(--shadow)}.sidebar.open{transform:translateX(0)}.topbar{height:58px;padding:0 16px}.icon-btn.mobile-menu{display:grid}.dashboard-search{width:min(100%,320px)}.search-shortcut,.topbar-status{display:none}.shell{padding:24px 16px 48px}.page-heading{display:grid}.hero-actions{justify-content:flex-start}.stats{grid-template-columns:1fr}.stat{border-right:0;border-bottom:1px solid var(--line)}.stat:last-child{border-bottom:0}.grid>aside .stack,.grid>aside.stack{grid-template-columns:1fr}.form-grid,.browser-toolbar,.provider-catalog{grid-template-columns:1fr}.card-header{align-items:flex-start}.table-wrap{overflow-x:auto}.hero h2{font-size:25px}}
   </style>
 </head>
-<body>
+<body hx-boost="true" hx-target="body" hx-swap="innerHTML show:top">
   <div class="app-shell">
     <aside id="admin-sidebar" class="sidebar" aria-label="Admin navigation">
       <div class="sidebar-brand"><div class="brand"><div class="logo">B</div><div><h1>BucketMux</h1><p>Storage gateway</p></div></div></div>
@@ -1674,6 +1796,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
         <a class="nav-link" href="#protection-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v10H5z"/></svg>Protection</a>
         <a class="nav-link" href="#cost-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M17 7.5c0-2-2-3-5-3s-5 1-5 3 2 3 5 3 5 1 5 3-2 3-5 3-5-1-5-3"/></svg>Costs</a>
         <a class="nav-link" href="#hooks-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7V4m8 3V4M6 7h12v5a6 6 0 0 1-12 0zM12 18v3"/></svg>Hooks</a>
+        <a class="nav-link" href="#wasm-plugins-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10l3 8-3 8H7l-3-8zM9 9v6m6-6v6"/></svg>WASM plugins</a>
         <a class="nav-link" href="#audit-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-2.8 8-7 10-4.2-2-7-5.5-7-10V6z"/></svg>Audit log</a>
       </nav>
       <div class="sidebar-footer"><div class="status"><span class="dot"></span> Admin operational</div><p class="sidebar-meta">Core S3 control plane</p></div>
@@ -1758,12 +1881,49 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           </div>
         </section>
 
+        <section id="provider-quota-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Provider quota</h2><p class="card-desc">Atomic reservations, configured hard limits, and remotely reconciled measurements are shown separately.</p></div></div>
+          <div class="card-body table-wrap">
+            {{if .ProviderQuotas}}<table class="table"><thead><tr><th>Provider</th><th>Used</th><th>Reserved</th><th>Available</th><th>Monthly uploads</th><th>Source</th></tr></thead><tbody>
+            {{range .ProviderQuotas}}<tr><td><span class="mono">{{.ProviderAccountID}}</span></td><td>{{formatBytes .UsedBytes}}</td><td>{{formatBytes .ReservedBytes}}</td><td>{{if eq .AvailableBytes -1}}unlimited{{else}}{{formatBytes .AvailableBytes}}{{end}}</td><td>{{formatBytes .MonthlyUploadedBytes}}{{if gt .MonthlyLimitBytes 0}} / {{formatBytes .MonthlyLimitBytes}}{{end}}</td><td><span class="pill {{if .Reliable}}healthy{{else}}degraded{{end}}">{{if .Source}}{{.Source}}{{else}}not measured{{end}}</span></td></tr>{{end}}
+            </tbody></table>{{else}}<div class="empty">No provider quota data yet.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="alerts-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">Active alerts</h2><p class="card-desc">Quota, credentials, provider health, and replication failures.</p></div></div>
+          <div class="card-body table-wrap">
+            {{if .Alerts}}<table class="table"><thead><tr><th>Severity</th><th>Type</th><th>Target</th><th>Message</th><th>Updated</th></tr></thead><tbody>
+            {{range .Alerts}}<tr><td><span class="pill {{if eq .Severity "critical"}}failed{{else}}degraded{{end}}">{{.Severity}}</span></td><td>{{.Type}}</td><td><span class="mono">{{.ProviderAccountID}} {{.Bucket}}/{{.Key}}</span></td><td>{{.Message}}</td><td>{{.UpdatedAt.Format "2006-01-02 15:04 UTC"}}</td></tr>{{end}}
+            </tbody></table>{{else}}<div class="empty">No active alerts.</div>{{end}}
+          </div>
+        </section>
+
         <section id="usage-card" class="card" data-search-section>
           <div class="card-header"><div><h2 class="card-title">Usage by provider and bucket</h2><p class="card-desc">Space used according to BucketMux's managed object index.</p></div></div>
           <div class="card-body table-wrap">
             {{if .Usage}}
             <table class="table"><thead><tr><th>Provider</th><th>Bucket</th><th>Objects</th><th>Size</th></tr></thead><tbody>{{range .Usage}}<tr><td><span class="provider-identity">{{template "providerIcon" (index $.ProviderBrands .ProviderAccountID)}}<span class="mono">{{.ProviderAccountID}}</span></span></td><td>{{.Bucket}}</td><td>{{.ObjectCount}}</td><td><span class="mono">{{formatBytes .Bytes}}</span></td></tr>{{end}}</tbody></table>
             {{else}}<div class="empty">No indexed objects yet. Upload files to see usage per provider and bucket.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="wasm-plugins-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">WASM processing pipelines</h2><p class="card-desc">Sandboxed asynchronous transforms and classifiers. Upload modules through <span class="mono">/admin/api/wasm-plugins</span>.</p></div></div>
+          <div class="card-body table-wrap">
+            {{if .WASMPlugins}}
+            <table class="table"><thead><tr><th>Plugin</th><th>Selectors</th><th>Limits</th><th>Module</th><th>Status</th></tr></thead><tbody>
+            {{range .WASMPlugins}}<tr><td><span class="name">{{.Name}}</span><span class="sub mono">{{.ID}} · {{.ABIVersion}}</span></td><td><span class="mono">{{.BucketPattern}}/{{.KeyPrefix}}*{{.KeySuffix}}</span><span class="sub">{{join .ContentTypes ", "}}</span></td><td><span class="mono">{{.TimeoutMillis}} ms · {{formatBytes .MemoryLimitBytes}}</span><span class="sub">input/output {{formatBytes .MaxInputBytes}} / {{formatBytes .MaxOutputBytes}}</span></td><td><span class="mono">sha256:{{.ModuleSHA256}}</span></td><td>{{if .Enabled}}<span class="pill enabled">enabled</span>{{else}}<span class="pill disabled">disabled</span>{{end}}</td></tr>{{end}}
+            </tbody></table>{{else}}<div class="empty">No WASM plugins installed. The Rust and Bun 1.4 examples under <span class="mono">examples/wasm</span> implement the ABI.</div>{{end}}
+          </div>
+        </section>
+
+        <section id="wasm-plugin-jobs-card" class="card" data-search-section>
+          <div class="card-header"><div><h2 class="card-title">WASM job history</h2><p class="card-desc">Durable claims, retries, source generations, and execution failures across all instances.</p></div></div>
+          <div class="card-body table-wrap">
+            {{if .WASMPluginJobs}}<table class="table"><thead><tr><th>Job</th><th>Plugin</th><th>Object</th><th>Status</th><th>Attempts</th><th>Result</th></tr></thead><tbody>
+            {{range .WASMPluginJobs}}<tr><td><span class="mono">{{.ID}}</span><span class="sub">{{.Event}}</span></td><td><span class="mono">{{.PluginID}}</span></td><td><span class="mono">{{.Bucket}}/{{.Key}}</span></td><td><span class="pill {{.Status}}">{{.Status}}</span></td><td>{{.Attempts}} / {{.MaxAttempts}}</td><td><span class="sub">{{if .LastError}}{{.LastError}}{{else}}{{.FinishedAt}}{{end}}</span></td></tr>{{end}}
+            </tbody></table>{{else}}<div class="empty">No WASM jobs yet.</div>{{end}}
           </div>
         </section>
 
@@ -1970,18 +2130,9 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
       <div class="dialog-body">
         <div id="provider-catalog-view">
           <p class="provider-catalog-intro">Provider presets fill compatible endpoints and defaults automatically. Credentials remain encrypted and are never shown again.</p>
+          <label>Filter providers by name<input id="provider-catalog-filter" type="search" name="q" placeholder="Azure, Hetzner, OCI…" autocomplete="off" hx-get="/admin/partials/provider-catalog" hx-trigger="input changed delay:180ms, search" hx-target="#provider-catalog" hx-swap="innerHTML"></label>
           <div id="provider-catalog" class="provider-catalog">
-            <button class="provider-preset" type="button" data-provider-preset="aws">{{template "providerIcon" "aws"}}<span class="provider-preset-copy"><strong>Amazon S3</strong><span>AWS regions and S3 credentials</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="cloudflare">{{template "providerIcon" "cloudflare"}}<span class="provider-preset-copy"><strong>Cloudflare R2</strong><span>S3-compatible, zero egress fees</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="gcs">{{template "providerIcon" "gcs"}}<span class="provider-preset-copy"><strong>Google Cloud Storage</strong><span>XML API interoperability keys</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="backblaze">{{template "providerIcon" "backblaze"}}<span class="provider-preset-copy"><strong>Backblaze B2</strong><span>S3-compatible application keys</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="digitalocean">{{template "providerIcon" "digitalocean"}}<span class="provider-preset-copy"><strong>DigitalOcean Spaces</strong><span>Region-aware Spaces endpoint</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="wasabi">{{template "providerIcon" "wasabi"}}<span class="provider-preset-copy"><strong>Wasabi</strong><span>S3-compatible hot cloud storage</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="minio">{{template "providerIcon" "minio"}}<span class="provider-preset-copy"><strong>MinIO</strong><span>Self-hosted S3-compatible storage</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="cloudinary">{{template "providerIcon" "cloudinary"}}<span class="provider-preset-copy"><strong>Cloudinary</strong><span>Image storage and delivery API</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="vercel">{{template "providerIcon" "vercel"}}<span class="provider-preset-copy"><strong>Vercel Blob</strong><span>Read-write token configuration</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="local">{{template "providerIcon" "local"}}<span class="provider-preset-copy"><strong>Local disk</strong><span>Filesystem storage for this instance</span></span></button>
-            <button class="provider-preset" type="button" data-provider-preset="custom">{{template "providerIcon" "custom"}}<span class="provider-preset-copy"><strong>Custom S3-compatible</strong><span>Any path-style S3 endpoint</span></span></button>
+            {{template "providerCatalog" .ProviderPresets}}
           </div>
           <p class="provider-icon-credit">Brand icons provided by <a href="https://thesvg.org/" target="_blank" rel="noopener noreferrer">theSVG</a>. Trademarks belong to their respective owners.</p>
         </div>
@@ -2019,6 +2170,9 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
                   <label>Cost per GB/month <span class="hint">lower cost wins on priority tie</span><input name="settings_cost_per_gb_month" placeholder="0.015"></label>
                   <label>Max object size bytes <span class="hint">skip this provider for larger objects</span><input name="settings_max_object_size_bytes" type="number" placeholder="104857600"></label>
                   <label>Min free bytes <span class="hint">reserve capacity headroom</span><input name="settings_min_free_bytes" type="number" placeholder="1073741824"></label>
+                  <label>Atomic quota margin bytes <span class="hint">never reserve the final safety margin</span><input name="settings_quota_margin_bytes" type="number" min="0" placeholder="536870912"></label>
+                  <label>Monthly upload quota bytes <span class="hint">resets atomically each UTC month</span><input name="settings_monthly_upload_quota_bytes" type="number" min="0" placeholder="107374182400"></label>
+                  <label>Quota alert threshold %<input name="settings_quota_alert_threshold_percent" type="number" min="1" max="100" value="85"></label>
                   <label class="checkbox"><input type="checkbox" name="enabled" checked> Enabled</label>
                 </div>
               </details>
@@ -2297,7 +2451,14 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
         cloudflare: { name: 'Cloudflare R2', summary: 'Paste the S3 API endpoint from your R2 bucket settings.', kind: 's3-compatible', id: 'cloudflare-r2', bucket: 'images', region: 'auto', endpoint: '', endpointPlaceholder: 'https://ACCOUNT_ID.r2.cloudflarestorage.com', icon: providerIconBase + 'cloudflare/color.svg', mark: 'R2', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
         gcs: { name: 'Google Cloud Storage', summary: 'Use HMAC interoperability access and secret keys.', kind: 's3-compatible', id: 'google-cloud-storage', bucket: 'images', region: 'auto', endpoint: 'https://storage.googleapis.com', icon: providerIconBase + 'google-cloud/default.svg', mark: 'G', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
         backblaze: { name: 'Backblaze B2', summary: 'Use an S3-compatible application key for the selected region.', kind: 's3-compatible', id: 'backblaze-b2', bucket: 'images', region: 'us-west-004', endpointTemplate: 'https://s3.{region}.backblazeb2.com', icon: providerIconBase + 'backblaze/default.svg', mark: 'B2', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        idrive: { name: 'IDrive e2', summary: 'Use the region-specific access keys issued by IDrive e2.', kind: 's3-compatible', id: 'idrive-e2', bucket: 'images', region: 'us-east-1', endpointTemplate: 'https://s3.{region}.idrivee2.com', mark: 'e2', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        azure: { name: 'Microsoft Azure Blob Storage', summary: 'Use the storage account name and one of its account keys.', kind: 'azure-blob', id: 'azure-blob', bucket: 'images', region: 'auto', endpoint: '', endpointPlaceholder: 'https://ACCOUNT.blob.core.windows.net', mark: 'AZ', accessLabel: 'Storage account name', secretLabel: 'Account key', fields: ['endpoint', 'access-key', 'secret-key'] },
+        oci: { name: 'Oracle Cloud Infrastructure (OCI) Object Storage', summary: 'Use an OCI Customer Secret Key and the S3 Compatibility endpoint for your namespace.', kind: 's3-compatible', id: 'oci-object-storage', bucket: 'images', region: 'eu-frankfurt-1', endpoint: '', endpointPlaceholder: 'https://NAMESPACE.compat.objectstorage.eu-frankfurt-1.oraclecloud.com', mark: 'OCI', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
         digitalocean: { name: 'DigitalOcean Spaces', summary: 'Use a Spaces access key and the region that owns the Space.', kind: 's3-compatible', id: 'digitalocean-spaces', bucket: 'images', region: 'nyc3', endpointTemplate: 'https://{region}.digitaloceanspaces.com', icon: providerIconBase + 'digitalocean/default.svg', mark: 'DO', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        hetzner: { name: 'Hetzner Object Storage', summary: 'Choose the bucket location and use project S3 credentials.', kind: 's3-compatible', id: 'hetzner-object-storage', bucket: 'images', region: 'fsn1', endpointTemplate: 'https://{region}.your-objectstorage.com', mark: 'HZ', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        scaleway: { name: 'Scaleway Object Storage', summary: 'Use a regional S3 endpoint with a Scaleway access and secret key.', kind: 's3-compatible', id: 'scaleway-object-storage', bucket: 'images', region: 'fr-par', endpointTemplate: 'https://s3.{region}.scw.cloud', mark: 'SCW', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        ovh: { name: 'OVHcloud Object Storage', summary: 'Use the exact S3 endpoint shown for the bucket region and storage class.', kind: 's3-compatible', id: 'ovh-object-storage', bucket: 'images', region: 'gra', endpoint: '', endpointPlaceholder: 'https://s3.gra.io.cloud.ovh.net', mark: 'OVH', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
+        akamai: { name: 'Akamai Connected Cloud', summary: 'Paste the S3 endpoint hostname assigned to the Linode Object Storage bucket.', kind: 's3-compatible', id: 'akamai-object-storage', bucket: 'images', region: 'us-east-1', endpoint: '', endpointPlaceholder: 'https://us-iad-18.linodeobjects.com', mark: 'AKA', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
         wasabi: { name: 'Wasabi', summary: 'Use Wasabi access credentials and the bucket region.', kind: 's3-compatible', id: 'wasabi', bucket: 'images', region: 'us-east-1', endpointTemplate: 'https://s3.{region}.wasabisys.com', icon: providerIconBase + 'wasabi/default.svg', mark: 'W', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
         minio: { name: 'MinIO', summary: 'Point BucketMux at your self-hosted MinIO API endpoint.', kind: 's3-compatible', id: 'minio', bucket: 'images', region: 'us-east-1', endpoint: 'http://localhost:9000', icon: providerIconBase + 'minio/default.svg', mark: 'M', fields: ['endpoint', 'region', 'access-key', 'secret-key'] },
         cloudinary: { name: 'Cloudinary', summary: 'Enter the cloud name, API key, and API secret.', kind: 'cloudinary', id: 'cloudinary', bucket: 'media', region: 'auto', icon: providerIconBase + 'cloudinary/default.svg', mark: 'C', accessLabel: 'API key', secretLabel: 'API secret', fields: ['access-key', 'secret-key', 'cloud-name'] },
@@ -2365,8 +2526,9 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
         if (providerID) providerID.focus();
       };
 
-      document.querySelectorAll('[data-provider-preset]').forEach((button) => {
-        button.addEventListener('click', () => applyProviderPreset(button.getAttribute('data-provider-preset')));
+      document.addEventListener('click', (event) => {
+        const button = event.target && event.target.closest ? event.target.closest('[data-provider-preset]') : null;
+        if (button) applyProviderPreset(button.getAttribute('data-provider-preset'));
       });
       if (providerBack) providerBack.addEventListener('click', showProviderCatalog);
       if (providerRegion) providerRegion.addEventListener('input', () => {

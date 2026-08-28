@@ -15,6 +15,11 @@ func (s *Service) PrometheusMetrics(ctx context.Context) string {
 	for _, provider := range providers {
 		fmt.Fprintf(&b, "bucketmux_provider_used_bytes{provider=%q,kind=%q} %d\n", provider.ID, provider.Kind, provider.UsedBytes)
 	}
+	b.WriteString("# HELP bucketmux_provider_reserved_bytes Bytes held by in-flight atomic reservations.\n")
+	b.WriteString("# TYPE bucketmux_provider_reserved_bytes gauge\n")
+	for _, provider := range providers {
+		fmt.Fprintf(&b, "bucketmux_provider_reserved_bytes{provider=%q,kind=%q} %d\n", provider.ID, provider.Kind, provider.ReservedBytes)
+	}
 	b.WriteString("# HELP bucketmux_provider_capacity_bytes Configured provider capacity in bytes.\n")
 	b.WriteString("# TYPE bucketmux_provider_capacity_bytes gauge\n")
 	for _, provider := range providers {
@@ -33,6 +38,7 @@ func (s *Service) PrometheusMetrics(ctx context.Context) string {
 	writeStatusCounts(&b, "bucketmux_hook_deliveries", "Webhook deliveries by status.", hookDeliveryStatusCounts(ctx, s))
 	writeStatusCounts(&b, "bucketmux_inventory_jobs", "Inventory jobs by status.", inventoryStatusCounts(ctx, s))
 	writeStatusCounts(&b, "bucketmux_repair_jobs", "Integrity scan and repair jobs by status.", repairStatusCounts(ctx, s))
+	writeStatusCounts(&b, "bucketmux_wasm_plugin_jobs", "WASM processing jobs by status.", wasmPluginStatusCounts(ctx, s))
 	trash, _ := s.Store.ListTrashObjects(ctx, 1000)
 	b.WriteString("# HELP bucketmux_trash_objects Objects retained in recoverable trash.\n")
 	b.WriteString("# TYPE bucketmux_trash_objects gauge\n")
@@ -50,6 +56,15 @@ func (s *Service) PrometheusMetrics(ctx context.Context) string {
 		fmt.Fprintf(&b, "bucketmux_worker_last_success_timestamp_seconds{worker=%q} %d\n", worker.Name, lastSuccess)
 	}
 	return b.String()
+}
+
+func wasmPluginStatusCounts(ctx context.Context, s *Service) map[string]int {
+	jobs, _ := s.Store.ListWASMPluginJobs(ctx, 200)
+	counts := map[string]int{}
+	for _, job := range jobs {
+		counts[job.Status]++
+	}
+	return counts
 }
 
 func repairStatusCounts(ctx context.Context, s *Service) map[string]int {

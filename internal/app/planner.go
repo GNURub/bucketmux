@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gnurub/bucketmux/internal/domain"
 )
@@ -18,6 +19,7 @@ type ProviderPlacementPlan struct {
 	Reason               string  `json:"reason,omitempty"`
 	Priority             int     `json:"priority"`
 	UsedBytes            int64   `json:"used_bytes"`
+	ReservedBytes        int64   `json:"reserved_bytes"`
 	CapacityBytes        int64   `json:"capacity_bytes"`
 	RemainingBytes       int64   `json:"remaining_bytes"`
 	CostPerGiBMonth      float64 `json:"cost_per_gib_month"`
@@ -49,13 +51,21 @@ func (s *Service) PlanPlacement(ctx context.Context, bucket string, size int64) 
 		cost := floatSetting(provider.Settings, "cost_per_gb_month")
 		remaining := int64(^uint64(0) >> 1)
 		if provider.CapacityBytes > 0 {
-			remaining = provider.CapacityBytes - provider.UsedBytes
+			remaining = provider.CapacityBytes - provider.UsedBytes - provider.ReservedBytes
 		}
-		candidate := ProviderPlacementPlan{ProviderAccountID: provider.ID, ProviderName: provider.Name, Eligible: true, Priority: provider.Priority, UsedBytes: provider.UsedBytes, CapacityBytes: provider.CapacityBytes, RemainingBytes: remaining, CostPerGiBMonth: cost, CurrentMonthlyCost: float64(provider.UsedBytes) / bytesPerGiB * cost, ProjectedMonthlyCost: float64(provider.UsedBytes+size) / bytesPerGiB * cost}
+		if provider.RemoteCapacityBytes > 0 {
+			remoteRemaining := provider.RemoteCapacityBytes - provider.RemoteUsedBytes - provider.ReservedBytes
+			if remoteRemaining < remaining {
+				remaining = remoteRemaining
+			}
+		}
+		candidate := ProviderPlacementPlan{ProviderAccountID: provider.ID, ProviderName: provider.Name, Eligible: true, Priority: provider.Priority, UsedBytes: provider.UsedBytes, ReservedBytes: provider.ReservedBytes, CapacityBytes: provider.CapacityBytes, RemainingBytes: remaining, CostPerGiBMonth: cost, CurrentMonthlyCost: float64(provider.UsedBytes) / bytesPerGiB * cost, ProjectedMonthlyCost: float64(provider.UsedBytes+size) / bytesPerGiB * cost}
 		switch {
 		case !provider.Enabled:
 			candidate.Eligible, candidate.Reason = false, "provider is disabled"
-		case provider.CapacityBytes > 0 && provider.UsedBytes+size > provider.CapacityBytes:
+		case provider.AvailabilityStatus != "" && (provider.UnavailableUntil.IsZero() || provider.UnavailableUntil.After(time.Now().UTC())):
+			candidate.Eligible, candidate.Reason = false, "provider is temporarily unavailable: "+provider.AvailabilityStatus
+		case remaining < size:
 			candidate.Eligible, candidate.Reason = false, "insufficient capacity"
 		case intSetting(provider.Settings, "max_object_size_bytes") > 0 && size > intSetting(provider.Settings, "max_object_size_bytes"):
 			candidate.Eligible, candidate.Reason = false, "object exceeds provider size policy"

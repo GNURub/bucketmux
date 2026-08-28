@@ -20,7 +20,9 @@ Object storage providers are cheap, but real projects often end up with several 
 - Cloudflare R2
 - MinIO
 - SeaweedFS S3
-- S3-compatible hosting providers
+- IDrive e2, DigitalOcean Spaces and Hetzner Object Storage
+- Scaleway, OVHcloud, Akamai and OCI Object Storage
+- Microsoft Azure Blob Storage
 - Cloudinary
 - Vercel Blob
 - local disk storage
@@ -72,7 +74,8 @@ Supported provider types:
 | Provider kind | Use case |
 | --- | --- |
 | `local` | Store objects on disk inside or mounted into the Docker container. |
-| `s3-compatible` | AWS S3, Cloudflare R2, MinIO, SeaweedFS, Backblaze B2, GCS XML/HMAC-style endpoints and similar services. |
+| `s3-compatible` | AWS S3, Cloudflare R2, MinIO, SeaweedFS, Backblaze B2, GCS XML/HMAC, IDrive e2, OCI, DigitalOcean Spaces, Hetzner, Scaleway, OVHcloud, Akamai and similar services. |
+| `azure-blob` | Microsoft Azure Blob Storage through native Shared Key authentication. |
 | `cloudinary` | Media storage through Cloudinary's API adapter. |
 | `vercel-blob` | Vercel Blob storage through the Vercel Blob API adapter. |
 
@@ -83,18 +86,32 @@ Multiple accounts of the same provider type are supported.
 On upload, BucketMux:
 
 1. lists enabled providers,
-2. removes providers without enough configured remaining capacity,
+2. removes providers that are degraded or lack configured, remotely measured or monthly capacity,
 3. chooses the lowest priority value,
 4. breaks ties by available free capacity,
-5. stores the object location in the local index.
+5. atomically reserves capacity in Turso or Postgres,
+6. retries the complete body on another account when the provider reports exhausted quota, throttling, invalid credentials or an outage,
+7. commits measured usage and stores the object location in the index.
 
 Reads are transparent because BucketMux knows where every object landed.
+
+### Sandboxed WASM processing
+
+Object-created events can enqueue durable `bucketmux.wasm.v1` pipelines for transforms, derived files, metadata extraction, classification, and typed embeddings (including one vector per detected face). Guests written in Go 1.27, TinyGo, Rust, or Bun 1.4/AssemblyScript run asynchronously with WASI filesystem isolation, import allowlisting, memory/time/stdio/output limits, atomic multi-instance claims, heartbeats, retries, generation deduplication, alerts, and normal BucketMux placement for every derived object. Embeddings are atomically persisted with model provenance and overwrite invalidation. Turso performs native exact vector search for single-instance deployments; production Postgres deployments can require pgvector 0.8+ and receive transactionally synchronized native vectors, migration backfill, partial HNSW indexes per model profile, iterative scans, and cross-instance index coordination. See [the ABI and security guide](docs/wasm-plugins.md) and examples under `examples/wasm`.
+
+Configured capacity is a hard BucketMux limit. Remote usage is reconciled from
+provider inventory; adapters with a native quota signal can additionally report
+remote capacity. Reservations include in-flight uploads, can retain a safety
+margin, expire after interrupted uploads, and enforce an optional UTC monthly
+upload allowance. This keeps the displayed available quota honest about its
+source instead of presenting an estimate as a provider guarantee.
 
 ### Embedded admin
 
 The optional embedded admin can be disabled completely. When enabled, it provides:
 
 - provider CRUD
+- searchable provider onboarding with credential and capability validation before enablement
 - encrypted provider credentials
 - bucket CRUD
 - per-bucket replication provider selection
@@ -103,6 +120,8 @@ The optional embedded admin can be disabled completely. When enabled, it provide
 - public presigned URL generation
 - safe object deletion requiring the exact confirmation phrase `Delete permanently`
 - provider health checks
+- configured/remote quota, in-flight reservations and monthly allowance visibility
+- alerts for near/exhausted quota, rejected credentials, degraded providers and exhausted replica retries
 - usage by provider and bucket
 - migration jobs by bucket/prefix with progress history
 - audit log for destructive admin operations
@@ -142,9 +161,11 @@ BucketMux includes helper endpoints compatible with Uppy AWS S3-style flows:
 
 BucketMux works with Bun's built-in S3 client using a custom endpoint in path-style mode.
 
-### Optional Postgres
+### SQLite single-instance and optional Postgres
 
-SQLite is the default and works well for local or single-instance deployments.
+`store.kind: sqlite` is the default local or single-instance backend. Internally it uses Turso Database as the SQLite-compatible engine, opens existing SQLite files in place, and does not link the former SQLite driver.
+
+Do not open the same embedded Turso file from multiple BucketMux processes. Use Postgres for multiple instances; Turso is intentionally the single-process backend.
 
 Postgres is supported as an optional state backend for higher write concurrency and multi-instance scenarios.
 
@@ -157,7 +178,7 @@ flowchart LR
   client[Client app\nS3 SDK / Bun / Uppy / curl]
   proxy[BucketMux\nS3-compatible gateway]
   admin[Embedded admin\noptional]
-  db[(SQLite or Postgres\nobject index + metadata)]
+  db[(Turso or Postgres\nobject index + metadata)]
   local[Local disk provider]
   s3[AWS S3]
   r2[Cloudflare R2]
@@ -235,15 +256,15 @@ docker run --rm -p 8080:8080 \
 ```
 
 The container image does not embed an active configuration or default credentials. It exits immediately unless `MASTER_KEY`, `S3_ACCESS_KEY`, and `S3_SECRET_KEY` are supplied directly or by a mounted configuration file.
-Its runtime is `scratch` (no shell or package manager), runs as UID/GID 10001,
-and exposes a built-in healthcheck. If the service listens somewhere other than
+Its runtime is a minimal pinned Alpine image required by Turso's embedded native
+library, runs as UID/GID 10001, and exposes a built-in healthcheck. If the service listens somewhere other than
 the default `:8080`, set `HEALTHCHECK_URL` to its internal `/readyz` URL.
 
 ### 4. Run with Docker Compose
 
 BucketMux ships with two compose examples.
 
-Single instance with SQLite and a local-disk provider:
+Single instance with the SQLite backend (powered by Turso) and a local-disk provider:
 
 ```bash
 BUCKETMUX_MASTER_KEY="replace-with-a-long-random-secret" \
@@ -277,7 +298,7 @@ Files:
 
 | File | Purpose |
 | --- | --- |
-| [`docker-compose.single.yml`](./docker-compose.single.yml) | One BucketMux instance, SQLite, local Docker volume provider. |
+| [`docker-compose.single.yml`](./docker-compose.single.yml) | One BucketMux instance, SQLite backend powered by Turso, local Docker volume provider. |
 | [`docker-compose.multiple.yml`](./docker-compose.multiple.yml) | Two BucketMux instances, shared Postgres, Nginx proxy. |
 | [`examples/config.single.yaml`](./examples/config.single.yaml) | Compose config for single-instance mode. |
 | [`examples/config.multiple.yaml`](./examples/config.multiple.yaml) | Compose config for multi-instance mode. |
@@ -365,10 +386,10 @@ Common environment variables:
 | `ADMIN_OIDC_REDIRECT_URL` | Absolute `/admin/oidc/callback` URL registered with the identity provider. |
 | `ADMIN_OIDC_ALLOWED_GROUPS` | Optional comma-separated group allowlist. |
 | `ADMIN_OIDC_SESSION_HOURS` | Encrypted admin session duration. Defaults to 8 hours. |
-| `STORE_KIND` | `sqlite` or `postgres`. |
-| `SQLITE_PATH` | SQLite database path. |
-| `SQLITE_MAX_OPEN_CONNS` | Maximum open SQLite connections. Defaults to the mixed-workload-tested value `10`. |
-| `SQLITE_MAX_IDLE_CONNS` | Maximum idle SQLite connections. Defaults to `10`. |
+| `STORE_KIND` | `sqlite` or `postgres`. The `sqlite` backend is executed by Turso Database. |
+| `SQLITE_PATH` | Embedded SQLite-compatible database path. Existing SQLite files are supported. |
+| `SQLITE_MAX_OPEN_CONNS` | Maximum open connections for the embedded backend. Defaults to `10`. |
+| `SQLITE_MAX_IDLE_CONNS` | Maximum idle connections for the embedded backend. Defaults to `10`. |
 | `POSTGRES_DSN` | Postgres connection string. |
 | `POSTGRES_MAX_OPEN_CONNS` | Max open Postgres connections. |
 | `POSTGRES_MAX_IDLE_CONNS` | Max idle Postgres connections. |
@@ -686,7 +707,7 @@ failover through the shared staging directory.
 ### k6 performance regression
 
 The pinned Grafana k6 workload exercises BucketMux over real HTTP with a local
-disk provider and SQLite. Its steady-state mix is 50% GET, 30% HEAD, 10% object
+disk provider and Turso. Its steady-state mix is 50% GET, 30% HEAD, 10% object
 listing, and 10% complete PUT/GET/DELETE lifecycles using 4 KiB objects. It
 checks response codes and downloaded byte counts and fails on more than 1%
 errors or when these local-gateway latency budgets are exceeded:
@@ -731,9 +752,9 @@ buckets:
       - "minio-backup"
 ```
 
-When an object is uploaded, BucketMux writes the primary object according to placement rules and enqueues replica jobs for the selected providers. Background workers claim pending replicas, copy the object to the target providers and update replica status in the object index.
+When an object is uploaded, BucketMux writes the primary object according to placement rules and enqueues replica jobs for the selected providers. Background workers claim pending replicas, copy the object to the target providers, verify size and SHA-256 (downloading the replica when the provider does not return checksum metadata), and update replica status in the object index.
 
-This keeps uploads fast. Database claims ensure that one replica job is owned by one worker at a time; interrupted `running` jobs are returned to the queue after the stale-work timeout.
+This keeps uploads fast. Database claims ensure that one replica job is owned by one worker at a time; transient failures use exponential backoff, exhausted retries raise a durable alert, and interrupted `running` jobs are returned to the queue after the stale-work timeout.
 
 GET and HEAD first use the indexed primary provider. If that provider is unavailable, BucketMux tries completed, enabled replicas and returns the provider actually used in `X-S3LS-Provider-Account`.
 
@@ -758,7 +779,7 @@ Prometheus-compatible metrics are exposed at:
 GET /metrics
 ```
 
-The endpoint includes provider usage, capacity, bucket/provider usage, migration, inventory and repair job counts, hook delivery counts, recoverable-trash count, and durable-worker failure/success metrics.
+The endpoint includes provider usage, capacity, bucket/provider usage, migration, inventory, repair and WASM job counts, hook delivery counts, recoverable-trash count, and durable-worker failure/success metrics.
 
 HTTP hooks use at-least-once delivery. Every request includes `X-BucketMux-Delivery-ID`; receivers should persist that value and ignore duplicates if processing must be idempotent.
 
@@ -783,6 +804,16 @@ Useful endpoints:
 | `POST /admin/api/buckets` | Create or update bucket. |
 | `GET /admin/api/usage` | Storage usage by provider and bucket. |
 | `GET /admin/api/provider-health` | Provider health checks. |
+| `GET /admin/api/provider-quotas` | Configured, remote, reserved, available and monthly quota values. |
+| `POST /admin/api/providers/{id}/quota/reconcile` | Reconcile one provider's remote quota and inventory usage now. |
+| `GET /admin/api/alerts` | List provider, quota and replication alerts. |
+| `GET, POST /admin/api/wasm-plugins` | List or validate and install a sandboxed WASI plugin. Module bytes are never returned by list operations. |
+| `POST /admin/api/wasm-plugins/validate` | Compile and validate a plugin without installing it. |
+| `DELETE /admin/api/wasm-plugins/{id}` | Delete a plugin and its job history. |
+| `GET /admin/api/wasm-plugin-jobs` | Inspect durable plugin execution history. |
+| `GET /admin/api/embeddings?bucket={bucket}&key={key}` | List embedding provenance for an object without exposing vector values. |
+| `POST /admin/api/embeddings/search` | Run cosine, dot-product, or L2 search through pgvector/HNSW or the bounded exact fallback. |
+| `GET /admin/api/embeddings/capabilities` | Report exact/pgvector backend, ANN status and active HNSW profiles. |
 | `POST /admin/api/providers/{id}/test` | Test provider credentials and connectivity. |
 | `GET /admin/api/providers/{id}/buckets` | Discover remote buckets. |
 | `GET, POST /admin/api/inventory-jobs` | Import or reconcile an existing remote inventory. |
@@ -850,9 +881,9 @@ Hooks support:
 
 ---
 
-## Postgres backend
+## SQLite and Postgres backends
 
-SQLite is the default:
+SQLite is the public single-instance backend name and uses Turso as its embedded engine:
 
 ```yaml
 store:

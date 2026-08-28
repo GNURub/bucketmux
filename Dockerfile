@@ -16,20 +16,22 @@ COPY internal ./internal
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/bucketmux ./cmd/bucketmux \
+    go build -tags=musl -trimpath -ldflags="-s -w" -o /out/bucketmux ./cmd/bucketmux \
     && mkdir /out/data \
     && chown 10001:10001 /out/data
 
-FROM scratch
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+RUN apk add --no-cache ca-certificates libgcc
 
 WORKDIR /app
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build --chown=10001:10001 /out/data /data
 COPY --from=build --chown=0:0 --chmod=0555 /out/bucketmux /usr/local/bin/bucketmux
 
 USER 10001:10001
 ENV DB_PATH=/data/switcher.db \
     DATA_DIR=/data \
+    TURSO_GO_CACHE_DIR=/data/.turso-cache \
     ADMIN_ENABLED=false
 
 VOLUME ["/data"]

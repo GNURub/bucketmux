@@ -12,7 +12,7 @@ import (
 
 	"github.com/gnurub/bucketmux/internal/config"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "modernc.org/sqlite"
+	_ "turso.tech/database/tursogo"
 
 	"github.com/gnurub/bucketmux/internal/domain"
 )
@@ -20,17 +20,20 @@ import (
 type dialect string
 
 const (
-	dialectSQLite   dialect = "sqlite"
-	dialectPostgres dialect = "postgres"
+	dialectTurso         dialect = "turso"
+	dialectPostgres      dialect = "postgres"
+	postgresSchemaLockID int64   = 7334247568550895608
 )
 
 type Store struct {
-	db      *sql.DB
-	dialect dialect
+	db            *sql.DB
+	dialect       dialect
+	vectorBackend string
+	vectorConfig  config.VectorSearchConfig
 }
 
 func Open(path string) (*Store, error) {
-	return OpenSQLite(path)
+	return OpenTurso(path)
 }
 
 func OpenConfig(cfg config.StoreConfig, legacyDBPath string) (*Store, error) {
@@ -39,30 +42,38 @@ func OpenConfig(cfg config.StoreConfig, legacyDBPath string) (*Store, error) {
 	}
 	switch cfg.Kind {
 	case "sqlite":
+		// The public backend remains sqlite. Turso is the internal SQLite-
+		// compatible engine; the former modernc driver is not linked.
 		path := cfg.SQLite.Path
 		if path == "" {
 			path = legacyDBPath
 		}
-		return openSQLite(path, cfg.SQLite.MaxOpenConns, cfg.SQLite.MaxIdleConns)
+		return openTurso(path, cfg.SQLite.MaxOpenConns, cfg.SQLite.MaxIdleConns)
 	case "postgres":
-		return OpenPostgres(cfg.Postgres)
+		return openPostgres(cfg.Postgres, cfg.VectorSearch)
 	default:
 		return nil, fmt.Errorf("unknown store kind %q", cfg.Kind)
 	}
 }
 
 func OpenSQLite(path string) (*Store, error) {
-	return openSQLite(path, 10, 10)
+	return OpenTurso(path)
 }
 
-func openSQLite(path string, maxOpenConns, maxIdleConns int) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+func OpenTurso(path string) (*Store, error) {
+	return openTurso(path, 10, 10)
+}
+
+func openTurso(path string, maxOpenConns, maxIdleConns int) (*Store, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("turso database path is required")
 	}
-	// SQLite permits concurrent WAL readers but still serializes writes. Keeping
-	// the pool bounded avoids connection churn and lock contention under mixed
-	// object workloads while retaining enough connections for parallel reads.
+	db, err := newTursoDB(path + "?_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("open turso: %w", err)
+	}
+	// Turso runs in-process and exposes database/sql. A bounded pool avoids
+	// connection churn while retaining parallel reads for mixed object traffic.
 	if maxOpenConns <= 0 {
 		maxOpenConns = 10
 	}
@@ -71,12 +82,16 @@ func openSQLite(path string, maxOpenConns, maxIdleConns int) (*Store, error) {
 	}
 	db.SetMaxOpenConns(maxOpenConns)
 	db.SetMaxIdleConns(maxIdleConns)
-	s := &Store{db: db, dialect: dialectSQLite}
+	s := &Store{db: db, dialect: dialectTurso, vectorBackend: "turso-native"}
 	if err := db.PingContext(context.Background()); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("ping sqlite: %w", err)
+		return nil, fmt.Errorf("ping turso: %w", err)
 	}
 	if err := s.migrate(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.configureTursoVectors(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -84,6 +99,10 @@ func openSQLite(path string, maxOpenConns, maxIdleConns int) (*Store, error) {
 }
 
 func OpenPostgres(cfg config.PostgresStoreConfig) (*Store, error) {
+	return openPostgres(cfg, config.VectorSearchConfig{Backend: "auto", HNSWM: 16, EFConstruction: 64, EFSearch: 100, MaxScanTuples: 20_000, MaxProfiles: 64})
+}
+
+func openPostgres(cfg config.PostgresStoreConfig, vectorConfig config.VectorSearchConfig) (*Store, error) {
 	db, err := sql.Open("pgx", cfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
@@ -94,12 +113,17 @@ func OpenPostgres(cfg config.PostgresStoreConfig) (*Store, error) {
 	if cfg.MaxIdleConns > 0 {
 		db.SetMaxIdleConns(cfg.MaxIdleConns)
 	}
-	s := &Store{db: db, dialect: dialectPostgres}
+	normalizeVectorConfig(&vectorConfig)
+	s := &Store{db: db, dialect: dialectPostgres, vectorBackend: "exact", vectorConfig: vectorConfig}
 	if err := db.PingContext(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	if err := s.migrate(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.configurePGVector(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -153,7 +177,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		// PostgreSQL's IF NOT EXISTS checks are not atomic across concurrent DDL.
 		// Serialize schema setup so multiple BucketMux replicas can safely start
 		// against a brand-new shared database at the same time.
-		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(7334247568550895608)"); err != nil {
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", postgresSchemaLockID); err != nil {
 			return fmt.Errorf("lock postgres migration: %w", err)
 		}
 		if err := s.migrateWith(ctx, tx); err != nil {
@@ -184,8 +208,18 @@ CREATE TABLE IF NOT EXISTS provider_accounts (
   secret_encrypted TEXT NOT NULL DEFAULT '',
   capacity_bytes INTEGER NOT NULL DEFAULT 0,
   used_bytes INTEGER NOT NULL DEFAULT 0,
+  remote_capacity_bytes INTEGER NOT NULL DEFAULT 0,
+  remote_used_bytes INTEGER NOT NULL DEFAULT 0,
+  reserved_bytes INTEGER NOT NULL DEFAULT 0,
+  monthly_uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+  monthly_period TEXT NOT NULL DEFAULT '',
   priority INTEGER NOT NULL DEFAULT 100,
   enabled INTEGER NOT NULL DEFAULT 1,
+  availability_status TEXT NOT NULL DEFAULT '',
+  availability_message TEXT NOT NULL DEFAULT '',
+  unavailable_until TEXT NOT NULL DEFAULT '',
+  quota_source TEXT NOT NULL DEFAULT '',
+  quota_checked_at TEXT NOT NULL DEFAULT '',
   settings_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -234,6 +268,28 @@ CREATE TABLE IF NOT EXISTS object_attributes (
   PRIMARY KEY (bucket, key),
   FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS object_embeddings (
+  id TEXT PRIMARY KEY,
+  bucket TEXT NOT NULL,
+  key TEXT NOT NULL,
+  source_checksum TEXT NOT NULL DEFAULT '',
+  source_updated_at TEXT NOT NULL DEFAULT '',
+  plugin_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  model TEXT NOT NULL,
+  model_version TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  dimensions INTEGER NOT NULL,
+  ordinal INTEGER NOT NULL,
+  values_blob BYTEA NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (bucket, key, plugin_id, kind, model, model_version, ordinal),
+  FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_object_embeddings_object ON object_embeddings(bucket, key);
+CREATE INDEX IF NOT EXISTS idx_object_embeddings_search ON object_embeddings(model, model_version, kind, metric, dimensions, bucket);
 CREATE TABLE IF NOT EXISTS object_versions (
   version_id TEXT NOT NULL,
   bucket TEXT NOT NULL,
@@ -281,14 +337,86 @@ CREATE TABLE IF NOT EXISTS object_replicas (
   remote_key TEXT NOT NULL DEFAULT '',
   size INTEGER NOT NULL DEFAULT 0,
   etag TEXT NOT NULL DEFAULT '',
+  checksum_sha256 TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL,
   error TEXT NOT NULL DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
+  next_attempt_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (bucket, key, provider_account_id)
 );
 CREATE INDEX IF NOT EXISTS idx_object_replicas_bucket_key ON object_replicas(bucket, key);
 CREATE INDEX IF NOT EXISTS idx_object_replicas_status ON object_replicas(status, updated_at);
+CREATE TABLE IF NOT EXISTS provider_reservations (
+  id TEXT PRIMARY KEY,
+  provider_account_id TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  FOREIGN KEY (provider_account_id) REFERENCES provider_accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_provider_reservations_expiry ON provider_reservations(expires_at);
+CREATE TABLE IF NOT EXISTS alerts (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  type TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  provider_account_id TEXT NOT NULL DEFAULT '',
+  bucket TEXT NOT NULL DEFAULT '',
+  key TEXT NOT NULL DEFAULT '',
+  message TEXT NOT NULL,
+  status TEXT NOT NULL,
+  resolved_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_status_updated ON alerts(status, updated_at DESC);
+CREATE TABLE IF NOT EXISTS wasm_plugins (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  abi_version TEXT NOT NULL,
+  module_base64 TEXT NOT NULL,
+  module_sha256 TEXT NOT NULL,
+  events_json TEXT NOT NULL DEFAULT '[]',
+  bucket_pattern TEXT NOT NULL DEFAULT '*',
+  key_prefix TEXT NOT NULL DEFAULT '',
+  key_suffix TEXT NOT NULL DEFAULT '',
+  content_types_json TEXT NOT NULL DEFAULT '[]',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  timeout_millis INTEGER NOT NULL DEFAULT 5000,
+  memory_limit_bytes INTEGER NOT NULL DEFAULT 67108864,
+  max_input_bytes INTEGER NOT NULL DEFAULT 67108864,
+  max_output_bytes INTEGER NOT NULL DEFAULT 67108864,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wasm_plugin_jobs (
+  id TEXT PRIMARY KEY,
+  plugin_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  key TEXT NOT NULL,
+  source_checksum TEXT NOT NULL DEFAULT '',
+  source_updated_at TEXT NOT NULL DEFAULT '',
+  dedupe_key TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  next_attempt_at TEXT NOT NULL,
+  last_error TEXT NOT NULL DEFAULT '',
+  result_json TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (plugin_id) REFERENCES wasm_plugins(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_wasm_plugin_jobs_pending ON wasm_plugin_jobs(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_wasm_plugin_jobs_recent ON wasm_plugin_jobs(created_at DESC);
 CREATE TABLE IF NOT EXISTS multipart_uploads (
   upload_id TEXT PRIMARY KEY,
   bucket TEXT NOT NULL,
@@ -469,6 +597,35 @@ CREATE TABLE IF NOT EXISTS maintenance_leases (
 	if err := s.addColumnIfMissing(ctx, executor, "inventory_jobs", "remote_bucket", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	for _, column := range []struct{ name, definition string }{
+		{"remote_capacity_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"remote_used_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"reserved_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"monthly_uploaded_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"monthly_period", "TEXT NOT NULL DEFAULT ''"},
+		{"availability_status", "TEXT NOT NULL DEFAULT ''"},
+		{"availability_message", "TEXT NOT NULL DEFAULT ''"},
+		{"unavailable_until", "TEXT NOT NULL DEFAULT ''"},
+		{"quota_source", "TEXT NOT NULL DEFAULT ''"},
+		{"quota_checked_at", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing(ctx, executor, "provider_accounts", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"checksum_sha256", "TEXT NOT NULL DEFAULT ''"},
+		{"attempts", "INTEGER NOT NULL DEFAULT 0"},
+		{"max_attempts", "INTEGER NOT NULL DEFAULT 5"},
+		{"next_attempt_at", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing(ctx, executor, "object_replicas", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err := s.addColumnIfMissing(ctx, executor, "wasm_plugin_jobs", "source_updated_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -498,8 +655,8 @@ func (s *Store) UpsertProvider(ctx context.Context, p domain.ProviderAccount) er
 		return fmt.Errorf("encode provider settings: %w", err)
 	}
 	_, err = s.exec(ctx, `
-INSERT INTO provider_accounts (id, name, kind, endpoint, region, bucket, access_key, secret_encrypted, capacity_bytes, used_bytes, priority, enabled, settings_json, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO provider_accounts (id, name, kind, endpoint, region, bucket, access_key, secret_encrypted, capacity_bytes, used_bytes, remote_capacity_bytes, remote_used_bytes, reserved_bytes, monthly_uploaded_bytes, monthly_period, priority, enabled, availability_status, availability_message, unavailable_until, quota_source, quota_checked_at, settings_json, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   name=excluded.name,
   kind=excluded.kind,
@@ -513,7 +670,7 @@ ON CONFLICT(id) DO UPDATE SET
   enabled=excluded.enabled,
   settings_json=excluded.settings_json,
   updated_at=excluded.updated_at
-`, p.ID, p.Name, string(p.Kind), p.Endpoint, p.Region, p.Bucket, p.AccessKey, p.SecretEncrypted, p.CapacityBytes, p.UsedBytes, p.Priority, boolToInt(p.Enabled), string(settings), p.CreatedAt.Format(time.RFC3339Nano), p.UpdatedAt.Format(time.RFC3339Nano))
+`, p.ID, p.Name, string(p.Kind), p.Endpoint, p.Region, p.Bucket, p.AccessKey, p.SecretEncrypted, p.CapacityBytes, p.UsedBytes, p.RemoteCapacityBytes, p.RemoteUsedBytes, p.ReservedBytes, p.MonthlyUploadedBytes, p.MonthlyPeriod, p.Priority, boolToInt(p.Enabled), p.AvailabilityStatus, p.AvailabilityMessage, formatOptionalTime(p.UnavailableUntil), p.QuotaSource, formatOptionalTime(p.QuotaCheckedAt), string(settings), p.CreatedAt.Format(time.RFC3339Nano), p.UpdatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("upsert provider: %w", err)
 	}
@@ -521,7 +678,7 @@ ON CONFLICT(id) DO UPDATE SET
 }
 
 func (s *Store) ListProviders(ctx context.Context, enabledOnly bool) ([]domain.ProviderAccount, error) {
-	query := `SELECT id, name, kind, endpoint, region, bucket, access_key, secret_encrypted, capacity_bytes, used_bytes, priority, enabled, settings_json, created_at, updated_at FROM provider_accounts`
+	query := `SELECT id, name, kind, endpoint, region, bucket, access_key, secret_encrypted, capacity_bytes, used_bytes, remote_capacity_bytes, remote_used_bytes, reserved_bytes, monthly_uploaded_bytes, monthly_period, priority, enabled, availability_status, availability_message, unavailable_until, quota_source, quota_checked_at, settings_json, created_at, updated_at FROM provider_accounts`
 	if enabledOnly {
 		query += ` WHERE enabled = 1`
 	}
@@ -544,7 +701,7 @@ func (s *Store) ListProviders(ctx context.Context, enabledOnly bool) ([]domain.P
 }
 
 func (s *Store) GetProvider(ctx context.Context, id string) (domain.ProviderAccount, error) {
-	row := s.queryRow(ctx, `SELECT id, name, kind, endpoint, region, bucket, access_key, secret_encrypted, capacity_bytes, used_bytes, priority, enabled, settings_json, created_at, updated_at FROM provider_accounts WHERE id = ?`, id)
+	row := s.queryRow(ctx, `SELECT id, name, kind, endpoint, region, bucket, access_key, secret_encrypted, capacity_bytes, used_bytes, remote_capacity_bytes, remote_used_bytes, reserved_bytes, monthly_uploaded_bytes, monthly_period, priority, enabled, availability_status, availability_message, unavailable_until, quota_source, quota_checked_at, settings_json, created_at, updated_at FROM provider_accounts WHERE id = ?`, id)
 	p, err := scanProvider(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -884,7 +1041,10 @@ SELECT
   o.bucket, o.key, o.provider_account_id, o.remote_bucket, o.remote_key, o.size,
   o.content_type, o.etag, o.checksum_sha256, o.replica_status, o.created_at, o.updated_at,
   p.id, p.name, p.kind, p.endpoint, p.region, p.bucket, p.access_key, p.secret_encrypted,
-  p.capacity_bytes, p.used_bytes, p.priority, p.enabled, p.settings_json, p.created_at, p.updated_at
+  p.capacity_bytes, p.used_bytes, p.remote_capacity_bytes, p.remote_used_bytes, p.reserved_bytes,
+  p.monthly_uploaded_bytes, p.monthly_period, p.priority, p.enabled, p.availability_status,
+  p.availability_message, p.unavailable_until, p.quota_source, p.quota_checked_at,
+  p.settings_json, p.created_at, p.updated_at
 FROM objects o
 JOIN provider_accounts p ON p.id = o.provider_account_id
 WHERE o.bucket = ? AND o.key = ?`, bucket, key)
@@ -930,23 +1090,33 @@ func (s *Store) UpsertObjectReplica(ctx context.Context, replica domain.ObjectRe
 		replica.CreatedAt = now
 	}
 	replica.UpdatedAt = now
+	if replica.MaxAttempts <= 0 {
+		replica.MaxAttempts = 5
+	}
+	if replica.NextAttemptAt.IsZero() {
+		replica.NextAttemptAt = now
+	}
 	_, err := s.exec(ctx, `
-INSERT INTO object_replicas (bucket, key, provider_account_id, remote_bucket, remote_key, size, etag, status, error, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO object_replicas (bucket, key, provider_account_id, remote_bucket, remote_key, size, etag, checksum_sha256, status, error, attempts, max_attempts, next_attempt_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(bucket, key, provider_account_id) DO UPDATE SET
   remote_bucket=excluded.remote_bucket,
   remote_key=excluded.remote_key,
   size=excluded.size,
   etag=excluded.etag,
+  checksum_sha256=excluded.checksum_sha256,
   status=excluded.status,
   error=excluded.error,
+  attempts=excluded.attempts,
+  max_attempts=excluded.max_attempts,
+  next_attempt_at=excluded.next_attempt_at,
   updated_at=excluded.updated_at
-`, replica.Bucket, replica.Key, replica.ProviderAccountID, replica.RemoteBucket, replica.RemoteKey, replica.Size, replica.ETag, replica.Status, replica.Error, replica.CreatedAt.Format(time.RFC3339Nano), replica.UpdatedAt.Format(time.RFC3339Nano))
+`, replica.Bucket, replica.Key, replica.ProviderAccountID, replica.RemoteBucket, replica.RemoteKey, replica.Size, replica.ETag, replica.ChecksumSHA256, replica.Status, replica.Error, replica.Attempts, replica.MaxAttempts, replica.NextAttemptAt.Format(time.RFC3339Nano), replica.CreatedAt.Format(time.RFC3339Nano), replica.UpdatedAt.Format(time.RFC3339Nano))
 	return err
 }
 
 func (s *Store) ListObjectReplicas(ctx context.Context, bucket, key string) ([]domain.ObjectReplica, error) {
-	rows, err := s.query(ctx, `SELECT bucket, key, provider_account_id, remote_bucket, remote_key, size, etag, status, error, created_at, updated_at FROM object_replicas WHERE bucket = ? AND key = ? ORDER BY provider_account_id ASC`, bucket, key)
+	rows, err := s.query(ctx, `SELECT bucket, key, provider_account_id, remote_bucket, remote_key, size, etag, checksum_sha256, status, error, attempts, max_attempts, next_attempt_at, created_at, updated_at FROM object_replicas WHERE bucket = ? AND key = ? ORDER BY provider_account_id ASC`, bucket, key)
 	if err != nil {
 		return nil, err
 	}
@@ -963,7 +1133,7 @@ func (s *Store) ListObjectReplicas(ctx context.Context, bucket, key string) ([]d
 }
 
 func (s *Store) ClaimNextObjectReplica(ctx context.Context) (domain.ObjectReplica, bool, error) {
-	rows, err := s.query(ctx, `SELECT bucket, key, provider_account_id FROM object_replicas WHERE status = ? ORDER BY updated_at ASC LIMIT 5`, "pending")
+	rows, err := s.query(ctx, `SELECT bucket, key, provider_account_id FROM object_replicas WHERE status = ? AND (next_attempt_at = '' OR next_attempt_at <= ?) ORDER BY next_attempt_at ASC, updated_at ASC LIMIT 5`, "pending", time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return domain.ObjectReplica{}, false, err
 	}
@@ -985,7 +1155,7 @@ func (s *Store) ClaimNextObjectReplica(ctx context.Context) (domain.ObjectReplic
 	}
 	for _, candidate := range candidates {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		res, err := s.exec(ctx, `UPDATE object_replicas SET status = ?, error = '', updated_at = ? WHERE bucket = ? AND key = ? AND provider_account_id = ? AND status = ?`, "running", now, candidate.Bucket, candidate.Key, candidate.ProviderAccountID, "pending")
+		res, err := s.exec(ctx, `UPDATE object_replicas SET status = ?, error = '', attempts = attempts + 1, updated_at = ? WHERE bucket = ? AND key = ? AND provider_account_id = ? AND status = ?`, "running", now, candidate.Bucket, candidate.Key, candidate.ProviderAccountID, "pending")
 		if err != nil {
 			return domain.ObjectReplica{}, false, err
 		}
@@ -1166,12 +1336,14 @@ func scanProvider(row scanner) (domain.ProviderAccount, error) {
 	var kind string
 	var enabled int
 	var settingsJSON string
-	var created, updated string
-	if err := row.Scan(&p.ID, &p.Name, &kind, &p.Endpoint, &p.Region, &p.Bucket, &p.AccessKey, &p.SecretEncrypted, &p.CapacityBytes, &p.UsedBytes, &p.Priority, &enabled, &settingsJSON, &created, &updated); err != nil {
+	var created, updated, unavailableUntil, quotaCheckedAt string
+	if err := row.Scan(&p.ID, &p.Name, &kind, &p.Endpoint, &p.Region, &p.Bucket, &p.AccessKey, &p.SecretEncrypted, &p.CapacityBytes, &p.UsedBytes, &p.RemoteCapacityBytes, &p.RemoteUsedBytes, &p.ReservedBytes, &p.MonthlyUploadedBytes, &p.MonthlyPeriod, &p.Priority, &enabled, &p.AvailabilityStatus, &p.AvailabilityMessage, &unavailableUntil, &p.QuotaSource, &quotaCheckedAt, &settingsJSON, &created, &updated); err != nil {
 		return p, err
 	}
 	p.Kind = domain.ProviderKind(kind)
 	p.Enabled = enabled == 1
+	p.UnavailableUntil = parseOptionalTime(unavailableUntil)
+	p.QuotaCheckedAt = parseOptionalTime(quotaCheckedAt)
 	_ = json.Unmarshal([]byte(settingsJSON), &p.Settings)
 	if p.Settings == nil {
 		p.Settings = map[string]string{}
@@ -1199,13 +1371,16 @@ func scanObjectWithProvider(row scanner) (domain.ObjectRecord, domain.ProviderAc
 	var providerKind string
 	var providerEnabled int
 	var providerSettingsJSON string
-	var providerCreated, providerUpdated string
+	var providerCreated, providerUpdated, unavailableUntil, quotaCheckedAt string
 	if err := row.Scan(
 		&obj.Bucket, &obj.Key, &obj.ProviderAccountID, &obj.RemoteBucket, &obj.RemoteKey, &obj.Size,
 		&obj.ContentType, &obj.ETag, &obj.ChecksumSHA256, &obj.ReplicaStatus, &objectCreated, &objectUpdated,
 		&account.ID, &account.Name, &providerKind, &account.Endpoint, &account.Region, &account.Bucket,
 		&account.AccessKey, &account.SecretEncrypted, &account.CapacityBytes, &account.UsedBytes,
-		&account.Priority, &providerEnabled, &providerSettingsJSON, &providerCreated, &providerUpdated,
+		&account.RemoteCapacityBytes, &account.RemoteUsedBytes, &account.ReservedBytes,
+		&account.MonthlyUploadedBytes, &account.MonthlyPeriod, &account.Priority, &providerEnabled,
+		&account.AvailabilityStatus, &account.AvailabilityMessage, &unavailableUntil,
+		&account.QuotaSource, &quotaCheckedAt, &providerSettingsJSON, &providerCreated, &providerUpdated,
 	); err != nil {
 		return obj, account, err
 	}
@@ -1213,6 +1388,8 @@ func scanObjectWithProvider(row scanner) (domain.ObjectRecord, domain.ProviderAc
 	obj.UpdatedAt, _ = time.Parse(time.RFC3339Nano, objectUpdated)
 	account.Kind = domain.ProviderKind(providerKind)
 	account.Enabled = providerEnabled == 1
+	account.UnavailableUntil = parseOptionalTime(unavailableUntil)
+	account.QuotaCheckedAt = parseOptionalTime(quotaCheckedAt)
 	_ = json.Unmarshal([]byte(providerSettingsJSON), &account.Settings)
 	if account.Settings == nil {
 		account.Settings = map[string]string{}
@@ -1224,12 +1401,13 @@ func scanObjectWithProvider(row scanner) (domain.ObjectRecord, domain.ProviderAc
 
 func scanObjectReplica(row scanner) (domain.ObjectReplica, error) {
 	var replica domain.ObjectReplica
-	var created, updated string
-	if err := row.Scan(&replica.Bucket, &replica.Key, &replica.ProviderAccountID, &replica.RemoteBucket, &replica.RemoteKey, &replica.Size, &replica.ETag, &replica.Status, &replica.Error, &created, &updated); err != nil {
+	var created, updated, nextAttempt string
+	if err := row.Scan(&replica.Bucket, &replica.Key, &replica.ProviderAccountID, &replica.RemoteBucket, &replica.RemoteKey, &replica.Size, &replica.ETag, &replica.ChecksumSHA256, &replica.Status, &replica.Error, &replica.Attempts, &replica.MaxAttempts, &nextAttempt, &created, &updated); err != nil {
 		return replica, err
 	}
 	replica.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	replica.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	replica.NextAttemptAt = parseOptionalTime(nextAttempt)
 	return replica, nil
 }
 

@@ -3,12 +3,14 @@ package admin
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,7 +35,7 @@ func TestAdminIndexShowsProviderForm(t *testing.T) {
 		t.Fatalf("status = %d body=%s", res.Code, res.Body.String())
 	}
 	body := res.Body.String()
-	for _, want := range []string{"Storage overview", "Action center", `id="admin-sidebar"`, `id="sidebar-toggle"`, `id="dashboard-search"`, `id="theme-toggle"`, `data-search-section`, `data-open-dialog="provider-dialog"`, `<dialog id="provider-dialog"`, `id="provider-catalog"`, `data-provider-preset="aws"`, `data-provider-preset="cloudflare"`, `data-provider-preset="custom"`, `id="provider-form"`, "cdn.jsdelivr.net/gh/glincker/thesvg@7870bc1c5f657d9accbb7f96cc457b8dd3363ee8", `<dialog id="bucket-dialog"`, `<dialog id="upload-dialog"`, `<dialog id="hook-dialog"`, `<dialog id="migration-dialog"`, `<dialog id="delete-object-dialog"`, "Delete permanently", "Migrate permanently", "Object browser", "Migration jobs", "Audit log", `id="object-browser-bucket"`, `id="migration-form"`, `id="migration-job-rows"`, `data-browse-objects`, "scrollIntoView", "/admin/api/objects/presign", "/admin/api/migrations", "Add / update provider", `name="secret_key"`, `value="s3-compatible"`, `settings_path`, `settings_cost_per_gb_month`, `settings_max_object_size_bytes`, `id="admin-upload-form"`, `name="replication_provider_ids"`, "Provider health", "Add / update HTTP hook", "Hook delivery history", "Secret headers"} {
+	for _, want := range []string{"Storage overview", "Action center", `id="admin-sidebar"`, `id="sidebar-toggle"`, `id="dashboard-search"`, `id="theme-toggle"`, `data-search-section`, `data-open-dialog="provider-dialog"`, `<dialog id="provider-dialog"`, `id="provider-catalog"`, `id="provider-catalog-filter"`, `hx-get="/admin/partials/provider-catalog"`, `htmx.org@2.0.10`, `data-provider-preset="aws"`, `data-provider-preset="cloudflare"`, `data-provider-preset="idrive"`, `data-provider-preset="azure"`, `data-provider-preset="oci"`, `data-provider-preset="hetzner"`, `data-provider-preset="scaleway"`, `data-provider-preset="ovh"`, `data-provider-preset="akamai"`, `data-provider-preset="custom"`, `id="provider-form"`, "cdn.jsdelivr.net/gh/glincker/thesvg@7870bc1c5f657d9accbb7f96cc457b8dd3363ee8", `<dialog id="bucket-dialog"`, `<dialog id="upload-dialog"`, `<dialog id="hook-dialog"`, `<dialog id="migration-dialog"`, `<dialog id="delete-object-dialog"`, "Delete permanently", "Migrate permanently", "Object browser", "Migration jobs", "Audit log", `id="object-browser-bucket"`, `id="migration-form"`, `id="migration-job-rows"`, `data-browse-objects`, "scrollIntoView", "/admin/api/objects/presign", "/admin/api/migrations", "Add / update provider", `name="secret_key"`, `value="s3-compatible"`, `settings_path`, `settings_cost_per_gb_month`, `settings_max_object_size_bytes`, `settings_monthly_upload_quota_bytes`, `id="admin-upload-form"`, `name="replication_provider_ids"`, "Provider health", "Provider quota", "Active alerts", "WASM processing pipelines", "WASM job history", "/admin/api/wasm-plugins", "Add / update HTTP hook", "Hook delivery history", "Secret headers"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("admin body missing %q", want)
 		}
@@ -42,6 +44,126 @@ func TestAdminIndexShowsProviderForm(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("advanced admin body missing %q", want)
 		}
+	}
+}
+
+func TestWASMPluginAdminAPIRejectsInvalidModuleAndListsSafely(t *testing.T) {
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+
+	body := strings.NewReader(`{"id":"bad","name":"Bad plugin","module_base64":"bm90IHdhc20=","enabled":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/wasm-plugins/validate", body)
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "not a WebAssembly binary") {
+		t.Fatalf("validate status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/api/wasm-plugins", nil)
+	req.SetBasicAuth("admin", "change-me")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || strings.Contains(res.Body.String(), "module_base64") {
+		t.Fatalf("list status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/api/wasm-plugin-jobs", nil)
+	req.SetBasicAuth("admin", "change-me")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("jobs status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestWASMPluginAdminAPIInstallsRustGuest(t *testing.T) {
+	if os.Getenv("BUCKETMUX_RUN_WASM_EXAMPLES") == "" {
+		t.Skip("set BUCKETMUX_RUN_WASM_EXAMPLES=1 after building examples")
+	}
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+	module, err := os.ReadFile(filepath.Join("..", "..", "examples", "wasm", "rust", "target", "wasm32-wasip1", "release", "image-classifier.wasm"))
+	if err != nil {
+		t.Fatalf("read Rust guest: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"id": "rust-classifier", "name": "Rust classifier", "module_base64": base64.StdEncoding.EncodeToString(module),
+		"events": []string{domain.WASMPluginEventObjectCreated}, "bucket_pattern": "images", "content_types": []string{"image/*"}, "enabled": true,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/wasm-plugins", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusCreated || strings.Contains(res.Body.String(), "module_base64") || !strings.Contains(res.Body.String(), "module_sha256") {
+		t.Fatalf("install status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/admin/api/wasm-plugins/rust-classifier", nil)
+	req.SetBasicAuth("admin", "change-me")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("delete status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestEmbeddingAdminAPIListsWithoutValuesAndSearches(t *testing.T) {
+	handler, cleanup := newTestAdminHandlerWithProvider(t)
+	defer cleanup()
+	ctx := context.Background()
+	object := domain.ObjectRecord{Bucket: "images", Key: "faces/alice.jpg", ProviderAccountID: "local-test", RemoteBucket: "images", RemoteKey: "faces/alice.jpg", Size: 3, ChecksumSHA256: "alice"}
+	if err := handler.svc.Store.PutObject(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	object, err := handler.svc.Store.GetObject(ctx, object.Bucket, object.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.svc.Store.ReplaceObjectEmbeddings(ctx, object, "face-plugin", []domain.WASMPluginEmbedding{{
+		Kind: "face", Model: "arcface", ModelVersion: "1", Metric: "cosine", Dimensions: 3,
+		Values: []float32{1, 0, 0}, Metadata: map[string]string{"box": "0,0,10,10"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/embeddings?bucket=images&key=faces%2Falice.jpg", nil)
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || strings.Contains(res.Body.String(), `"values"`) || !strings.Contains(res.Body.String(), `"model":"arcface"`) {
+		t.Fatalf("list status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/embeddings/search", strings.NewReader(`{"bucket":"images","kind":"face","model":"arcface","model_version":"1","values":[1,0,0],"limit":5}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("admin", "change-me")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || strings.Contains(res.Body.String(), `"values"`) || !strings.Contains(res.Body.String(), `"score":`) || !strings.Contains(res.Body.String(), "alice.jpg") {
+		t.Fatalf("search status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/api/embeddings/capabilities", nil)
+	req.SetBasicAuth("admin", "change-me")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"backend":"turso-native-exact"`) || !strings.Contains(res.Body.String(), `"engine":"turso"`) {
+		t.Fatalf("capabilities status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestProviderCatalogHTMXFilter(t *testing.T) {
+	handler, cleanup := newTestAdminHandler(t)
+	defer cleanup()
+	req := httptest.NewRequest(http.MethodGet, "/admin/partials/provider-catalog?q=azure", nil)
+	req.Header.Set("HX-Request", "true")
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), "Microsoft Azure Blob Storage") || strings.Contains(res.Body.String(), "Hetzner Object Storage") {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
 }
 
@@ -57,7 +179,14 @@ func TestProviderBrandDetectionAndIconURLs(t *testing.T) {
 		{name: "cloudflare", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://account.r2.cloudflarestorage.com"}, brand: "cloudflare", hasIcon: true},
 		{name: "google cloud", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://storage.googleapis.com"}, brand: "gcs", hasIcon: true},
 		{name: "backblaze", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.us-west-004.backblazeb2.com"}, brand: "backblaze", hasIcon: true},
+		{name: "idrive", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.us-east-1.idrivee2.com"}, brand: "idrive"},
+		{name: "azure", account: domain.ProviderAccount{Kind: domain.ProviderKindAzureBlob, Endpoint: "https://account.blob.core.windows.net"}, brand: "azure"},
+		{name: "oci", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://namespace.compat.objectstorage.eu-frankfurt-1.oraclecloud.com"}, brand: "oci"},
 		{name: "digitalocean", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://nyc3.digitaloceanspaces.com"}, brand: "digitalocean", hasIcon: true},
+		{name: "hetzner", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://fsn1.your-objectstorage.com"}, brand: "hetzner"},
+		{name: "scaleway", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.fr-par.scw.cloud"}, brand: "scaleway"},
+		{name: "ovh", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.gra.io.cloud.ovh.net"}, brand: "ovh"},
+		{name: "akamai", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://us-iad-18.linodeobjects.com"}, brand: "akamai"},
 		{name: "wasabi", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://s3.us-east-1.wasabisys.com"}, brand: "wasabi", hasIcon: true},
 		{name: "minio", account: domain.ProviderAccount{Kind: domain.ProviderKindS3Compat, Endpoint: "https://minio.example.com"}, brand: "minio", hasIcon: true},
 		{name: "cloudinary", account: domain.ProviderAccount{Kind: domain.ProviderKindCloudinary}, brand: "cloudinary", hasIcon: true},
@@ -182,7 +311,7 @@ func TestAdminCredentialLifecycleAndOpenAPI(t *testing.T) {
 	request.SetBasicAuth("admin", "change-me")
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"openapi":"3.1.0"`) || !strings.Contains(response.Body.String(), "/admin/api/inventory-jobs") || !strings.Contains(response.Body.String(), "/admin/api/repair-jobs") {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"openapi":"3.1.0"`) || !strings.Contains(response.Body.String(), "/admin/api/inventory-jobs") || !strings.Contains(response.Body.String(), "/admin/api/repair-jobs") || !strings.Contains(response.Body.String(), "/admin/api/provider-quotas") || !strings.Contains(response.Body.String(), "/admin/api/alerts") {
 		t.Fatalf("OpenAPI status=%d body=%s", response.Code, response.Body.String())
 	}
 }
@@ -314,6 +443,38 @@ func TestAdminProviderHealthAPI(t *testing.T) {
 	}
 	if len(health) != 1 || health[0].ProviderAccountID != "local-test" || health[0].Status != domain.ProviderHealthHealthy {
 		t.Fatalf("health = %+v", health)
+	}
+}
+
+func TestAdminProviderQuotaAndAlertsAPI(t *testing.T) {
+	handler, cleanup := newTestAdminHandlerWithProvider(t)
+	defer cleanup()
+
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/providers/local-test/quota/reconcile", nil)
+	request.SetBasicAuth("admin", "change-me")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"provider_account_id":"local-test"`) || !strings.Contains(response.Body.String(), `"source":"remote-inventory"`) {
+		t.Fatalf("reconcile status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/admin/api/provider-quotas", nil)
+	request.SetBasicAuth("admin", "change-me")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"provider_account_id":"local-test"`) || !strings.Contains(response.Body.String(), `"reliable":true`) {
+		t.Fatalf("quotas status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	if err := handler.svc.Store.UpsertAlert(t.Context(), domain.Alert{ID: "alert-test", DedupeKey: "provider:local-test", Type: domain.AlertTypeProviderDegraded, Severity: domain.AlertSeverityWarning, ProviderAccountID: "local-test", Message: "test degraded provider"}); err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/admin/api/alerts?status=open", nil)
+	request.SetBasicAuth("admin", "change-me")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"type":"provider.degraded"`) || !strings.Contains(response.Body.String(), "test degraded provider") {
+		t.Fatalf("alerts status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

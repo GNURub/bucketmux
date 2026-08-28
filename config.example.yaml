@@ -6,7 +6,7 @@ server:
   max_upload_bytes: 5368709120 # 5 GiB total object size
   max_multipart_part_bytes: 536870912 # 512 MiB per part
   max_admin_body_bytes: 1048576 # 1 MiB for non-upload admin mutations
-  # Deprecated but still supported for SQLite. Prefer store.sqlite.path.
+  # Deprecated but still supported. Prefer store.sqlite.path.
   db_path: "/data/switcher.db"
   # Optional. Use when BucketMux runs behind a reverse proxy/path and admin-generated
   # presigned public URLs must point to the external origin.
@@ -15,6 +15,7 @@ server:
   master_key: "change-me-use-a-long-random-secret"
 
 store:
+  # sqlite uses Turso Database as the embedded SQLite-compatible engine.
   kind: "sqlite" # sqlite | postgres
   sqlite:
     path: "/data/switcher.db"
@@ -24,6 +25,14 @@ store:
     dsn: "postgres://bucketmux:bucketmux@postgres:5432/bucketmux?sslmode=disable"
     max_open_conns: 25
     max_idle_conns: 10
+  vector_search:
+    # Turso uses its native exact vector functions. Postgres auto uses pgvector when available.
+    backend: "auto" # auto | exact | pgvector
+    hnsw_m: 16
+    ef_construction: 64
+    ef_search: 100
+    max_scan_tuples: 20000
+    max_profiles: 64 # one HNSW partial index per kind/model/version/metric/dimension profile
 
 coordination:
   # database works for single and multi-instance deployments through DB job claims.
@@ -55,6 +64,15 @@ admin:
     scopes: ["openid", "profile", "email"]
     allowed_groups: ["storage-admins"]
     session_hours: 8
+
+wasm_plugins:
+  enabled: true
+  max_module_bytes: 16777216 # 16 MiB executable payload
+  default_timeout_millis: 30000
+  default_memory_limit_bytes: 134217728 # 128 MiB linear memory
+  default_max_input_bytes: 536870912 # 512 MiB source object
+  default_max_output_bytes: 536870912 # aggregate declared outputs
+  default_max_attempts: 3
 
 buckets:
   - name: "images"
@@ -95,6 +113,10 @@ providers:
       max_object_size_bytes: "0"
       # keep free space reserved after each routed upload.
       min_free_bytes: "0"
+      # atomic reservation margin and optional UTC-month upload allowance.
+      quota_margin_bytes: "0"
+      monthly_upload_quota_bytes: "0"
+      quota_alert_threshold_percent: "85"
 
   # Cloudflare R2 / Backblaze B2 / MinIO / GCS XML API style provider.
   # - id: "r2-main"
@@ -107,6 +129,29 @@ providers:
   #   secret_key: "..."
   #   capacity_bytes: 10737418240
   #   priority: 10
+  #   enabled: true
+
+  # Additional tested S3-compatible presets use the same deep adapter:
+  # IDrive e2:        https://s3.REGION.idrivee2.com
+  # DigitalOcean:     https://REGION.digitaloceanspaces.com
+  # Hetzner:          https://LOCATION.your-objectstorage.com
+  # Scaleway:         https://s3.REGION.scw.cloud
+  # OVHcloud:         paste the exact regional endpoint shown in the OVH console
+  # Akamai/Linode:    paste the assigned *.linodeobjects.com S3 endpoint
+  # OCI Object Store: https://NAMESPACE.compat.objectstorage.REGION.oraclecloud.com
+  # OCI requires Customer Secret Keys for the S3 Compatibility API.
+
+  # Native Microsoft Azure Blob Storage adapter. access_key is the storage
+  # account name and secret_key is a base64 account key.
+  # - id: "azure-main"
+  #   name: "Azure Blob main"
+  #   kind: "azure-blob"
+  #   endpoint: "https://ACCOUNT.blob.core.windows.net"
+  #   bucket: "images" # Azure container
+  #   access_key: "ACCOUNT"
+  #   secret_key: "BASE64_ACCOUNT_KEY"
+  #   capacity_bytes: 107374182400
+  #   priority: 20
   #   enabled: true
 
   # SeaweedFS S3 API backend. Start SeaweedFS with:

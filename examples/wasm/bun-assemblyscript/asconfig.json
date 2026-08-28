@@ -1,0 +1,16 @@
+{
+  "options": {
+    "runtime": "stub",
+    "exportRuntime": false,
+    "bindings": "raw"
+  },
+  "targets": {
+    "release": {
+      "outFile": "build/image-classifier.wasm",
+      "textFile": "build/image-classifier.wat",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "noAssert": true
+    }
+  }
+}

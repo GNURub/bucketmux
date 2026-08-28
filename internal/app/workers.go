@@ -183,8 +183,8 @@ func (s *Service) recordWorkerSuccess(name string) {
 func (s *Service) workerRuntimeSnapshots() []workerRuntimeSnapshot {
 	s.workerState.mu.RLock()
 	defer s.workerState.mu.RUnlock()
-	names := []string{"hooks", "inventory", "lifecycle", "migration", "repair", "replication"}
-	seen := map[string]bool{"hooks": true, "inventory": true, "lifecycle": true, "migration": true, "repair": true, "replication": true}
+	names := []string{"hooks", "inventory", "lifecycle", "migration", "quota", "repair", "replication", "wasm-plugins"}
+	seen := map[string]bool{"hooks": true, "inventory": true, "lifecycle": true, "migration": true, "quota": true, "repair": true, "replication": true, "wasm-plugins": true}
 	for name := range s.workerState.failures {
 		if seen[name] {
 			continue

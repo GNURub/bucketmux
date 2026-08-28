@@ -26,6 +26,17 @@ type BucketDiscoverer interface {
 	DiscoverBuckets(ctx context.Context, account domain.ProviderAccount) ([]domain.ProviderBucket, error)
 }
 
+// QuotaReporter is implemented only when an adapter can measure the backing
+// storage directly. S3-compatible APIs intentionally do not implement it:
+// the S3 protocol has no portable account-quota operation.
+type QuotaReporter interface {
+	Quota(ctx context.Context, account domain.ProviderAccount) (capacityBytes, usedBytes int64, source string, err error)
+}
+
+type CapabilityReporter interface {
+	Capabilities(account domain.ProviderAccount) domain.ProviderCapabilities
+}
+
 type Registry struct {
 	adapters map[domain.ProviderKind]Adapter
 }

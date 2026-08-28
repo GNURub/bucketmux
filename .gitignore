@@ -11,3 +11,7 @@ prompts.txt
 /.codegraph/
 /.playwright-cli/
 /output/
+/examples/wasm/rust/target/
+/examples/wasm/bun-assemblyscript/node_modules/
+/examples/wasm/bun-assemblyscript/build/
+/examples/wasm/go/build/

@@ -17,6 +17,7 @@ type Config struct {
 	Coordination CoordinationConfig `yaml:"coordination"`
 	S3           S3Config           `yaml:"s3"`
 	Admin        AdminConfig        `yaml:"admin"`
+	WASMPlugins  WASMPluginConfig   `yaml:"wasm_plugins"`
 	Providers    []ProviderConfig   `yaml:"providers"`
 	Buckets      []BucketConfig     `yaml:"buckets"`
 }
@@ -34,9 +35,19 @@ type ServerConfig struct {
 }
 
 type StoreConfig struct {
-	Kind     string              `yaml:"kind"`
-	SQLite   SQLiteStoreConfig   `yaml:"sqlite"`
-	Postgres PostgresStoreConfig `yaml:"postgres"`
+	Kind         string              `yaml:"kind"`
+	SQLite       SQLiteStoreConfig   `yaml:"sqlite"`
+	Postgres     PostgresStoreConfig `yaml:"postgres"`
+	VectorSearch VectorSearchConfig  `yaml:"vector_search"`
+}
+
+type VectorSearchConfig struct {
+	Backend        string `yaml:"backend"`
+	HNSWM          int    `yaml:"hnsw_m"`
+	EFConstruction int    `yaml:"ef_construction"`
+	EFSearch       int    `yaml:"ef_search"`
+	MaxScanTuples  int    `yaml:"max_scan_tuples"`
+	MaxProfiles    int    `yaml:"max_profiles"`
 }
 
 type SQLiteStoreConfig struct {
@@ -86,6 +97,16 @@ type OIDCConfig struct {
 	Scopes        []string `yaml:"scopes"`
 	AllowedGroups []string `yaml:"allowed_groups"`
 	SessionHours  int      `yaml:"session_hours"`
+}
+
+type WASMPluginConfig struct {
+	Enabled                 bool  `yaml:"enabled"`
+	MaxModuleBytes          int64 `yaml:"max_module_bytes"`
+	DefaultTimeoutMillis    int   `yaml:"default_timeout_millis"`
+	DefaultMemoryLimitBytes int64 `yaml:"default_memory_limit_bytes"`
+	DefaultMaxInputBytes    int64 `yaml:"default_max_input_bytes"`
+	DefaultMaxOutputBytes   int64 `yaml:"default_max_output_bytes"`
+	DefaultMaxAttempts      int   `yaml:"default_max_attempts"`
 }
 
 type ProviderConfig struct {
@@ -151,10 +172,14 @@ func Default() Config {
 			MaxMultipartPartBytes: 512 << 20,
 			MaxAdminBodyBytes:     1 << 20,
 		},
-		Store:        StoreConfig{Kind: "sqlite", SQLite: SQLiteStoreConfig{Path: "/data/switcher.db", MaxOpenConns: 10, MaxIdleConns: 10}, Postgres: PostgresStoreConfig{MaxOpenConns: 25, MaxIdleConns: 10}},
+		Store: StoreConfig{
+			Kind: "sqlite", SQLite: SQLiteStoreConfig{Path: "/data/switcher.db", MaxOpenConns: 10, MaxIdleConns: 10}, Postgres: PostgresStoreConfig{MaxOpenConns: 25, MaxIdleConns: 10},
+			VectorSearch: VectorSearchConfig{Backend: "auto", HNSWM: 16, EFConstruction: 64, EFSearch: 100, MaxScanTuples: 20_000, MaxProfiles: 64},
+		},
 		Coordination: CoordinationConfig{Kind: "database", Redis: RedisConfig{Addr: "127.0.0.1:6379", KeyPrefix: "bucketmux", LeaseTTLSeconds: 5}},
 		S3:           S3Config{Region: "auto"},
 		Admin:        AdminConfig{Enabled: false, Username: "admin"},
+		WASMPlugins:  WASMPluginConfig{Enabled: true, MaxModuleBytes: 16 << 20, DefaultTimeoutMillis: 30_000, DefaultMemoryLimitBytes: 128 << 20, DefaultMaxInputBytes: 512 << 20, DefaultMaxOutputBytes: 512 << 20, DefaultMaxAttempts: 3},
 		Buckets:      []BucketConfig{{Name: "images"}},
 	}
 }
@@ -164,7 +189,7 @@ func (c Config) Validate() error {
 		return errors.New("server.addr is required")
 	}
 	if c.Server.DBPath == "" {
-		if c.Store.Kind == "" || c.Store.Kind == "sqlite" {
+		if (c.Store.Kind == "" || c.Store.Kind == "sqlite") && c.Store.SQLite.Path == "" {
 			return errors.New("server.db_path or store.sqlite.path is required")
 		}
 	}
@@ -182,6 +207,19 @@ func (c Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unknown store.kind %q", c.Store.Kind)
+	}
+	switch c.Store.VectorSearch.Backend {
+	case "", "auto", "exact":
+	case "pgvector":
+		if c.Store.Kind != "postgres" {
+			return errors.New("store.vector_search.backend=pgvector requires store.kind=postgres")
+		}
+	default:
+		return fmt.Errorf("unknown store.vector_search.backend %q", c.Store.VectorSearch.Backend)
+	}
+	vector := c.Store.VectorSearch
+	if vector.HNSWM < 2 || vector.HNSWM > 100 || vector.EFConstruction < 4 || vector.EFConstruction > 10_000 || vector.EFSearch < 1 || vector.EFSearch > 10_000 || vector.MaxScanTuples < 1 || vector.MaxProfiles < 1 || vector.MaxProfiles > 1024 {
+		return errors.New("store.vector_search HNSW/search limits are outside supported bounds")
 	}
 	switch c.Coordination.Kind {
 	case "", "database":
@@ -203,6 +241,12 @@ func (c Config) Validate() error {
 	}
 	if c.Server.MaxAdminBodyBytes <= 0 {
 		return errors.New("server.max_admin_body_bytes must be greater than zero")
+	}
+	if c.WASMPlugins.MaxModuleBytes <= 0 || c.WASMPlugins.DefaultTimeoutMillis <= 0 || c.WASMPlugins.DefaultMemoryLimitBytes <= 0 || c.WASMPlugins.DefaultMaxInputBytes <= 0 || c.WASMPlugins.DefaultMaxOutputBytes <= 0 || c.WASMPlugins.DefaultMaxAttempts <= 0 {
+		return errors.New("wasm plugin limits must be greater than zero")
+	}
+	if c.WASMPlugins.MaxModuleBytes > 128<<20 || c.WASMPlugins.DefaultMemoryLimitBytes > 1<<30 || c.WASMPlugins.DefaultTimeoutMillis > 600_000 {
+		return errors.New("wasm plugin defaults exceed the hard module, memory, or timeout ceiling")
 	}
 	if c.S3.AccessKey == "" || c.S3.SecretKey == "" {
 		return errors.New("s3.access_key and s3.secret_key are required")
@@ -266,6 +310,24 @@ func (c *Config) Normalize() {
 	if c.Server.MaxAdminBodyBytes == 0 {
 		c.Server.MaxAdminBodyBytes = 1 << 20
 	}
+	if c.WASMPlugins.MaxModuleBytes == 0 {
+		c.WASMPlugins.MaxModuleBytes = 16 << 20
+	}
+	if c.WASMPlugins.DefaultTimeoutMillis == 0 {
+		c.WASMPlugins.DefaultTimeoutMillis = 30_000
+	}
+	if c.WASMPlugins.DefaultMemoryLimitBytes == 0 {
+		c.WASMPlugins.DefaultMemoryLimitBytes = 128 << 20
+	}
+	if c.WASMPlugins.DefaultMaxInputBytes == 0 {
+		c.WASMPlugins.DefaultMaxInputBytes = 512 << 20
+	}
+	if c.WASMPlugins.DefaultMaxOutputBytes == 0 {
+		c.WASMPlugins.DefaultMaxOutputBytes = 512 << 20
+	}
+	if c.WASMPlugins.DefaultMaxAttempts == 0 {
+		c.WASMPlugins.DefaultMaxAttempts = 3
+	}
 	c.Store.Kind = strings.TrimSpace(c.Store.Kind)
 	if c.Store.Kind == "" {
 		c.Store.Kind = "sqlite"
@@ -275,6 +337,25 @@ func (c *Config) Normalize() {
 	}
 	if c.Store.Postgres.MaxIdleConns == 0 {
 		c.Store.Postgres.MaxIdleConns = 10
+	}
+	c.Store.VectorSearch.Backend = strings.ToLower(strings.TrimSpace(c.Store.VectorSearch.Backend))
+	if c.Store.VectorSearch.Backend == "" {
+		c.Store.VectorSearch.Backend = "auto"
+	}
+	if c.Store.VectorSearch.HNSWM == 0 {
+		c.Store.VectorSearch.HNSWM = 16
+	}
+	if c.Store.VectorSearch.EFConstruction == 0 {
+		c.Store.VectorSearch.EFConstruction = 64
+	}
+	if c.Store.VectorSearch.EFSearch == 0 {
+		c.Store.VectorSearch.EFSearch = 100
+	}
+	if c.Store.VectorSearch.MaxScanTuples == 0 {
+		c.Store.VectorSearch.MaxScanTuples = 20_000
+	}
+	if c.Store.VectorSearch.MaxProfiles == 0 {
+		c.Store.VectorSearch.MaxProfiles = 64
 	}
 	if c.Store.SQLite.MaxOpenConns == 0 {
 		c.Store.SQLite.MaxOpenConns = 10
@@ -329,6 +410,12 @@ func applyEnv(c *Config) {
 	setString(&c.Store.Postgres.DSN, "POSTGRES_DSN")
 	setInt(&c.Store.Postgres.MaxOpenConns, "POSTGRES_MAX_OPEN_CONNS")
 	setInt(&c.Store.Postgres.MaxIdleConns, "POSTGRES_MAX_IDLE_CONNS")
+	setString(&c.Store.VectorSearch.Backend, "VECTOR_SEARCH_BACKEND")
+	setInt(&c.Store.VectorSearch.HNSWM, "VECTOR_SEARCH_HNSW_M")
+	setInt(&c.Store.VectorSearch.EFConstruction, "VECTOR_SEARCH_EF_CONSTRUCTION")
+	setInt(&c.Store.VectorSearch.EFSearch, "VECTOR_SEARCH_EF_SEARCH")
+	setInt(&c.Store.VectorSearch.MaxScanTuples, "VECTOR_SEARCH_MAX_SCAN_TUPLES")
+	setInt(&c.Store.VectorSearch.MaxProfiles, "VECTOR_SEARCH_MAX_PROFILES")
 	setString(&c.Coordination.Kind, "COORDINATION_KIND")
 	setString(&c.Coordination.Redis.Addr, "REDIS_ADDR")
 	setString(&c.Coordination.Redis.Password, "REDIS_PASSWORD")
@@ -345,6 +432,15 @@ func applyEnv(c *Config) {
 	setString(&c.Admin.OIDC.ClientSecret, "ADMIN_OIDC_CLIENT_SECRET")
 	setString(&c.Admin.OIDC.RedirectURL, "ADMIN_OIDC_REDIRECT_URL")
 	setInt(&c.Admin.OIDC.SessionHours, "ADMIN_OIDC_SESSION_HOURS")
+	setInt64(&c.WASMPlugins.MaxModuleBytes, "WASM_PLUGIN_MAX_MODULE_BYTES")
+	setInt(&c.WASMPlugins.DefaultTimeoutMillis, "WASM_PLUGIN_DEFAULT_TIMEOUT_MILLIS")
+	setInt64(&c.WASMPlugins.DefaultMemoryLimitBytes, "WASM_PLUGIN_DEFAULT_MEMORY_LIMIT_BYTES")
+	setInt64(&c.WASMPlugins.DefaultMaxInputBytes, "WASM_PLUGIN_DEFAULT_MAX_INPUT_BYTES")
+	setInt64(&c.WASMPlugins.DefaultMaxOutputBytes, "WASM_PLUGIN_DEFAULT_MAX_OUTPUT_BYTES")
+	setInt(&c.WASMPlugins.DefaultMaxAttempts, "WASM_PLUGIN_DEFAULT_MAX_ATTEMPTS")
+	if value := strings.TrimSpace(os.Getenv("WASM_PLUGINS_ENABLED")); value != "" {
+		c.WASMPlugins.Enabled, _ = strconv.ParseBool(value)
+	}
 	if value := strings.TrimSpace(os.Getenv("ADMIN_OIDC_ENABLED")); value != "" {
 		c.Admin.OIDC.Enabled, _ = strconv.ParseBool(value)
 	}

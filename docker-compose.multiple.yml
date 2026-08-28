@@ -6,7 +6,7 @@ x-logging: &default-logging
 
 services:
   postgres:
-    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    image: pgvector/pgvector:0.8.6-pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
     environment:
       POSTGRES_DB: bucketmux
       POSTGRES_USER: bucketmux
@@ -61,6 +61,7 @@ services:
       POSTGRES_DSN: postgres://bucketmux:${BUCKETMUX_POSTGRES_PASSWORD:?set BUCKETMUX_POSTGRES_PASSWORD}@postgres:5432/bucketmux?sslmode=disable
       POSTGRES_MAX_OPEN_CONNS: 25
       POSTGRES_MAX_IDLE_CONNS: 10
+      VECTOR_SEARCH_BACKEND: pgvector
       COORDINATION_KIND: redis
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: ${BUCKETMUX_REDIS_PASSWORD:?set BUCKETMUX_REDIS_PASSWORD}

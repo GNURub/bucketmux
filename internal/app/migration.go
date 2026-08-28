@@ -194,24 +194,43 @@ func (s *Service) migrateObjectToProvider(ctx context.Context, obj domain.Object
 	if !targetAccount.Enabled {
 		return fmt.Errorf("target provider is disabled")
 	}
-	if targetAccount.CapacityBytes > 0 && targetAccount.UsedBytes+obj.Size > targetAccount.CapacityBytes {
-		return fmt.Errorf("target provider has insufficient capacity")
+	reservation := domain.ProviderReservation{ID: randomIdentifier("migration-res-", 10), ProviderAccountID: targetProviderID, Bytes: obj.Size, ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	margin := intSetting(targetAccount.Settings, "quota_margin_bytes")
+	if minFree := intSetting(targetAccount.Settings, "min_free_bytes"); minFree > margin {
+		margin = minFree
 	}
-	body, _, err := sourceAdapter.Get(ctx, sourceAccount, obj)
+	reserved, err := s.Store.ReserveProviderCapacity(ctx, reservation, margin, intSetting(targetAccount.Settings, "monthly_upload_quota_bytes"), time.Now().UTC().Format("2006-01"))
 	if err != nil {
 		return err
 	}
-	defer func() { _ = body.Close() }()
-	stored, err := s.putOnProvider(ctx, targetAccount, domain.PutObjectInput{Bucket: obj.Bucket, Key: obj.Key, Size: obj.Size, ContentType: obj.ContentType}, body)
+	if !reserved {
+		return fmt.Errorf("target provider has insufficient quota")
+	}
+	body, _, err := sourceAdapter.Get(ctx, sourceAccount, obj)
 	if err != nil {
+		_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
+		return err
+	}
+	defer func() { _ = body.Close() }()
+	stored, err := s.putOnProvider(ctx, targetAccount, domain.PutObjectInput{Bucket: obj.Bucket, Key: obj.Key, Size: obj.Size, ContentType: obj.ContentType, ChecksumSHA256: obj.ChecksumSHA256}, body)
+	if err != nil {
+		_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
+		s.recordProviderWriteFailure(ctx, targetAccount, err)
+		return err
+	}
+	if stored.ChecksumSHA256 == "" {
+		stored.ChecksumSHA256 = obj.ChecksumSHA256
+	}
+	if err := s.Store.CommitProviderReservation(ctx, reservation.ID, stored.Size); err != nil {
+		_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
 		return err
 	}
 	if mode == domain.MigrationModeCopy {
 		_ = s.subtractExistingReplicaUsage(ctx, obj.Bucket, obj.Key, targetProviderID)
-		if err := s.Store.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: obj.Bucket, Key: obj.Key, ProviderAccountID: targetProviderID, RemoteBucket: stored.RemoteBucket, RemoteKey: stored.RemoteKey, Size: stored.Size, ETag: stored.ETag, Status: "succeeded"}); err != nil {
+		if err := s.Store.UpsertObjectReplica(ctx, domain.ObjectReplica{Bucket: obj.Bucket, Key: obj.Key, ProviderAccountID: targetProviderID, RemoteBucket: stored.RemoteBucket, RemoteKey: stored.RemoteKey, Size: stored.Size, ETag: stored.ETag, ChecksumSHA256: stored.ChecksumSHA256, Status: "succeeded"}); err != nil {
 			return err
 		}
-		return s.Store.AddProviderUsage(ctx, targetProviderID, stored.Size)
+		return nil
 	}
 	migrated := obj
 	migrated.ProviderAccountID = targetProviderID
@@ -224,7 +243,6 @@ func (s *Service) migrateObjectToProvider(ctx context.Context, obj domain.Object
 	if err := s.Store.PutObject(ctx, migrated); err != nil {
 		return err
 	}
-	_ = s.Store.AddProviderUsage(ctx, targetProviderID, stored.Size)
 	if err := sourceAdapter.Delete(ctx, sourceAccount, obj); err == nil {
 		_ = s.Store.AddProviderUsage(ctx, sourceAccount.ID, -obj.Size)
 	}

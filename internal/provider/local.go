@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gnurub/bucketmux/internal/domain"
+	"golang.org/x/sys/unix"
 )
 
 type LocalAdapter struct {
@@ -51,6 +53,9 @@ func (a *LocalAdapter) Put(ctx context.Context, account domain.ProviderAccount, 
 	hash := sha256.New()
 	written, err := io.Copy(file, io.TeeReader(body, hash))
 	if err != nil {
+		if errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT) {
+			return domain.StoredObject{}, &Error{Op: "put local object", Kind: FailureQuota, Err: err}
+		}
 		return domain.StoredObject{}, fmt.Errorf("write local object: %w", err)
 	}
 	if err := file.Sync(); err != nil {
@@ -77,6 +82,28 @@ func (a *LocalAdapter) Put(ctx context.Context, account domain.ProviderAccount, 
 		ETag:              `"` + checksum + `"`,
 		ChecksumSHA256:    checksum,
 	}, nil
+}
+
+func (a *LocalAdapter) Quota(_ context.Context, account domain.ProviderAccount) (int64, int64, string, error) {
+	root, err := a.providerRoot(account)
+	if err != nil {
+		return 0, 0, "local-filesystem", err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return 0, 0, "local-filesystem", err
+	}
+	var stats unix.Statfs_t
+	if err := unix.Statfs(root, &stats); err != nil {
+		return 0, 0, "local-filesystem", fmt.Errorf("stat local filesystem quota: %w", err)
+	}
+	blockSize := int64(stats.Bsize)
+	used := int64(stats.Blocks-stats.Bfree) * blockSize
+	available := int64(stats.Bavail) * blockSize
+	return used + available, used, "local-filesystem", nil
+}
+
+func (a *LocalAdapter) Capabilities(domain.ProviderAccount) domain.ProviderCapabilities {
+	return domain.ProviderCapabilities{ListObjects: true, DiscoverBuckets: true, RemoteQuota: true, Checksums: true}
 }
 
 func (a *LocalAdapter) DiscoverBuckets(_ context.Context, account domain.ProviderAccount) ([]domain.ProviderBucket, error) {

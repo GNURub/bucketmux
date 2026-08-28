@@ -46,7 +46,7 @@ buckets:
 	}
 }
 
-func TestLoadDefaultsToSQLiteStore(t *testing.T) {
+func TestLoadDefaultsToSQLiteStoreBackedByTurso(t *testing.T) {
 	setRequiredEnv(t)
 
 	cfg, err := Load("")
@@ -75,6 +75,21 @@ func TestLoadSQLitePoolFromEnv(t *testing.T) {
 	}
 	if cfg.Store.SQLite.MaxOpenConns != 6 || cfg.Store.SQLite.MaxIdleConns != 4 {
 		t.Fatalf("Store.SQLite pool = %+v, want 6 open and 4 idle connections", cfg.Store.SQLite)
+	}
+}
+
+func TestLoadSQLiteConfigurationUsesPublicSQLiteKind(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("STORE_KIND", "sqlite")
+	t.Setenv("SQLITE_PATH", "/tmp/legacy-bucketmux.db")
+	t.Setenv("SQLITE_MAX_OPEN_CONNS", "3")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Store.Kind != "sqlite" || cfg.Store.SQLite.Path != "/tmp/legacy-bucketmux.db" || cfg.Store.SQLite.MaxOpenConns != 3 {
+		t.Fatalf("sqlite config was not preserved: %+v", cfg.Store)
 	}
 }
 
@@ -111,13 +126,24 @@ func TestLoadPostgresFromEnv(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "postgres://bucketmux:bucketmux@localhost:5432/bucketmux?sslmode=disable")
 	t.Setenv("POSTGRES_MAX_OPEN_CONNS", "7")
 	t.Setenv("POSTGRES_MAX_IDLE_CONNS", "3")
+	t.Setenv("VECTOR_SEARCH_BACKEND", "pgvector")
+	t.Setenv("VECTOR_SEARCH_EF_SEARCH", "128")
 
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Store.Kind != "postgres" || cfg.Store.Postgres.DSN == "" || cfg.Store.Postgres.MaxOpenConns != 7 || cfg.Store.Postgres.MaxIdleConns != 3 {
+	if cfg.Store.Kind != "postgres" || cfg.Store.Postgres.DSN == "" || cfg.Store.Postgres.MaxOpenConns != 7 || cfg.Store.Postgres.MaxIdleConns != 3 || cfg.Store.VectorSearch.Backend != "pgvector" || cfg.Store.VectorSearch.EFSearch != 128 {
 		t.Fatalf("postgres config = %+v", cfg.Store)
+	}
+}
+
+func TestPgvectorBackendRequiresPostgres(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("VECTOR_SEARCH_BACKEND", "pgvector")
+	_, err := Load("")
+	if err == nil || !strings.Contains(err.Error(), "requires store.kind=postgres") {
+		t.Fatalf("Load() error = %v, want pgvector/postgres validation", err)
 	}
 }
 

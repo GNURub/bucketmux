@@ -5,7 +5,7 @@ server:
   max_upload_bytes: 5368709120
   max_multipart_part_bytes: 536870912
   max_admin_body_bytes: 1048576
-  # Deprecated but still supported for SQLite. Prefer store.sqlite.path.
+  # Deprecated but still supported. Prefer store.sqlite.path.
   db_path: "./data/switcher.db"
   # Prefer MASTER_KEY env var in production. This local file is only for development.
   master_key: "replace-with-a-long-random-secret"

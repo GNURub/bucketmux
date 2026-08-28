@@ -1,0 +1,12 @@
+{
+  "name": "bucketmux-bun-wasm-examples",
+  "private": true,
+  "packageManager": "bun@1.4.1",
+  "scripts": {
+    "build": "asc assembly/image-classifier.ts --target release && asc assembly/timeout-fixture.ts --outFile build/timeout-fixture.wasm --runtime stub --optimize --noAssert",
+    "test": "bun run build && bun test"
+  },
+  "devDependencies": {
+    "assemblyscript": "0.28.20"
+  }
+}

@@ -1,4 +1,4 @@
-.PHONY: run-local build test test-race lint vulncheck ci backup-postgres restore-postgres test-bun test-fetch test-imgproxy test-k6 test-migration test-ministack test-multi-instance test-uppy test-seaweedfs test-redis
+.PHONY: run-local build test test-race test-turso-vector-scale lint vulncheck ci backup-postgres restore-postgres test-bun test-fetch test-imgproxy test-k6 test-migration test-ministack test-multi-instance test-uppy test-seaweedfs test-redis test-wasm-plugins
 
 run-local:
 	mkdir -p data
@@ -12,6 +12,9 @@ test:
 
 test-race:
 	GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go/pkg/mod go test -race ./...
+
+test-turso-vector-scale:
+	BUCKETMUX_RUN_TURSO_SCALE=1 GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go/pkg/mod go test ./internal/store -run '^TestTursoNativeVectorScaleIntegration$$' -count=1 -v
 
 lint:
 	go vet ./...
@@ -60,3 +63,9 @@ test-seaweedfs:
 
 test-redis:
 	BUCKETMUX_RUN_REDIS_INTEGRATION=1 GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go/pkg/mod go test ./internal/coordination -run TestRedisCoordinatorIntegration -count=1 -v
+
+test-wasm-plugins:
+	./examples/wasm/go/build.sh
+	./examples/wasm/rust/build.sh
+	cd examples/wasm/bun-assemblyscript && bun install --frozen-lockfile && bun run build && bun test
+	BUCKETMUX_RUN_WASM_EXAMPLES=1 GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go/pkg/mod go test ./internal/wasmplugin ./internal/app ./internal/admin -run 'TestGoBuiltWASMExamples|TestRustAndBunBuiltWASMExamples|TestGoEmbeddingPipelineSingleAndMultipleInstances|TestWASMPipelineSingleAndMultipleInstances|TestWASMPluginAdminAPIInstallsRustGuest|TestEmbeddingAdminAPIListsWithoutValuesAndSearches' -count=1 -v

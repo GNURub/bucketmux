@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gnurub/bucketmux/internal/domain"
 )
@@ -32,7 +33,10 @@ func (r *PlacementRouter) Choose(ctx context.Context, input domain.PutObjectInpu
 		if exclude != nil && exclude[p.ID] {
 			continue
 		}
-		if p.CapacityBytes > 0 && p.UsedBytes+input.Size > p.CapacityBytes {
+		if providerUnavailable(p, time.Now().UTC()) {
+			continue
+		}
+		if available := remaining(p); input.Size > available {
 			continue
 		}
 		if violatesProviderPolicy(p, input) {
@@ -69,6 +73,15 @@ func violatesProviderPolicy(p domain.ProviderAccount, input domain.PutObjectInpu
 	if minFree := int64Setting(p, "min_free_bytes"); minFree > 0 && remaining(p)-input.Size < minFree {
 		return true
 	}
+	if monthlyLimit := int64Setting(p, "monthly_upload_quota_bytes"); monthlyLimit > 0 {
+		monthlyUsed := p.MonthlyUploadedBytes
+		if p.MonthlyPeriod != time.Now().UTC().Format("2006-01") {
+			monthlyUsed = 0
+		}
+		if monthlyUsed+p.ReservedBytes+input.Size > monthlyLimit {
+			return true
+		}
+	}
 	return false
 }
 
@@ -97,10 +110,27 @@ func int64Setting(p domain.ProviderAccount, key string) int64 {
 }
 
 func remaining(p domain.ProviderAccount) int64 {
-	if p.CapacityBytes <= 0 {
-		return 1<<62 - 1
+	available := int64(1<<62 - 1)
+	if p.CapacityBytes > 0 {
+		available = p.CapacityBytes - p.UsedBytes - p.ReservedBytes
 	}
-	return p.CapacityBytes - p.UsedBytes
+	if p.RemoteCapacityBytes > 0 {
+		remoteAvailable := p.RemoteCapacityBytes - p.RemoteUsedBytes - p.ReservedBytes
+		if remoteAvailable < available {
+			available = remoteAvailable
+		}
+	}
+	return available
+}
+
+func providerUnavailable(p domain.ProviderAccount, now time.Time) bool {
+	if p.AvailabilityStatus == "" {
+		return false
+	}
+	if (p.AvailabilityStatus == "throttled" || p.AvailabilityStatus == "unavailable") && !p.UnavailableUntil.IsZero() && !p.UnavailableUntil.After(now) {
+		return false
+	}
+	return true
 }
 
 var ErrNoProviderAvailable = errors.New("no provider available")

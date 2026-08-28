@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -10,7 +11,7 @@ import (
 	"github.com/gnurub/bucketmux/internal/domain"
 )
 
-func TestOpenConfigAppliesSQLiteConnectionLimit(t *testing.T) {
+func TestOpenConfigAppliesSQLiteConnectionLimitToTursoEngine(t *testing.T) {
 	s, err := OpenConfig(config.StoreConfig{
 		Kind: "sqlite",
 		SQLite: config.SQLiteStoreConfig{
@@ -29,6 +30,47 @@ func TestOpenConfigAppliesSQLiteConnectionLimit(t *testing.T) {
 	})
 	if got := s.db.Stats().MaxOpenConnections; got != 6 {
 		t.Fatalf("MaxOpenConnections = %d, want 6", got)
+	}
+}
+
+func TestOpenConfigSQLiteUsesTursoEngine(t *testing.T) {
+	s, err := OpenConfig(config.StoreConfig{
+		Kind: "sqlite",
+		SQLite: config.SQLiteStoreConfig{
+			Path: filepath.Join(t.TempDir(), "legacy.db"),
+		},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if s.dialect != dialectTurso || s.vectorBackend != "turso-native" {
+		t.Fatalf("sqlite backend opened dialect=%q vectorBackend=%q", s.dialect, s.vectorBackend)
+	}
+}
+
+func TestTursoConnectionsEnforceForeignKeys(t *testing.T) {
+	s, err := OpenTurso(filepath.Join(t.TempDir(), "foreign-keys.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	first, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = first.Close() }()
+	second, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+	for index, connection := range []*sql.Conn{first, second} {
+		var enabled int
+		if err := connection.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&enabled); err != nil || enabled != 1 {
+			t.Fatalf("Turso connection %d foreign_keys=%d err=%v", index, enabled, err)
+		}
 	}
 }
 

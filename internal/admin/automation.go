@@ -8,9 +8,10 @@ import (
 )
 
 type declarativeConfig struct {
-	Providers []providerRequest `json:"providers"`
-	Buckets   []domain.Bucket   `json:"buckets"`
-	Hooks     []hookRequest     `json:"hooks"`
+	Providers   []providerRequest   `json:"providers"`
+	Buckets     []domain.Bucket     `json:"buckets"`
+	Hooks       []hookRequest       `json:"hooks"`
+	WASMPlugins []wasmPluginRequest `json:"wasm_plugins"`
 }
 
 func (h *Handler) applyDeclarativeConfig(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +53,13 @@ func (h *Handler) applyDeclarativeConfig(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "providers_applied": len(request.Providers), "buckets_applied": len(request.Buckets), "hooks_applied": len(request.Hooks)})
+	for _, pluginRequest := range request.WASMPlugins {
+		if err := h.svc.UpsertWASMPlugin(r.Context(), pluginRequest.toDomain()); err != nil {
+			writeProblem(w, http.StatusBadRequest, "wasm-plugin-apply-failed", err.Error())
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "providers_applied": len(request.Providers), "buckets_applied": len(request.Buckets), "hooks_applied": len(request.Hooks), "wasm_plugins_applied": len(request.WASMPlugins)})
 }
 
 func (h *Handler) openapi(w http.ResponseWriter, r *http.Request) {
@@ -62,19 +69,30 @@ func (h *Handler) openapi(w http.ResponseWriter, r *http.Request) {
 	}
 	paths := map[string]any{}
 	for path, operations := range map[string][]string{
-		"/admin/api/providers":          {"get", "post"},
-		"/admin/api/buckets":            {"get", "post"},
-		"/admin/api/hooks":              {"get", "post"},
-		"/admin/api/objects":            {"get", "delete"},
-		"/admin/api/migrations":         {"get", "post"},
-		"/admin/api/inventory-jobs":     {"get", "post"},
-		"/admin/api/repair-jobs":        {"get", "post"},
-		"/admin/api/access-credentials": {"get", "post"},
-		"/admin/api/trash":              {"get"},
-		"/admin/api/placement-plan":     {"get"},
-		"/admin/api/cost-optimizations": {"get"},
-		"/admin/api/repair":             {"post"},
-		"/admin/api/declarative/apply":  {"post"},
+		"/admin/api/providers":                      {"get", "post"},
+		"/admin/api/providers/{id}/test":            {"post"},
+		"/admin/api/providers/{id}/quota/reconcile": {"post"},
+		"/admin/api/provider-health":                {"get"},
+		"/admin/api/provider-quotas":                {"get"},
+		"/admin/api/alerts":                         {"get"},
+		"/admin/api/wasm-plugins":                   {"get", "post"},
+		"/admin/api/wasm-plugins/validate":          {"post"},
+		"/admin/api/wasm-plugin-jobs":               {"get"},
+		"/admin/api/embeddings":                     {"get"},
+		"/admin/api/embeddings/capabilities":        {"get"},
+		"/admin/api/embeddings/search":              {"post"},
+		"/admin/api/buckets":                        {"get", "post"},
+		"/admin/api/hooks":                          {"get", "post"},
+		"/admin/api/objects":                        {"get", "delete"},
+		"/admin/api/migrations":                     {"get", "post"},
+		"/admin/api/inventory-jobs":                 {"get", "post"},
+		"/admin/api/repair-jobs":                    {"get", "post"},
+		"/admin/api/access-credentials":             {"get", "post"},
+		"/admin/api/trash":                          {"get"},
+		"/admin/api/placement-plan":                 {"get"},
+		"/admin/api/cost-optimizations":             {"get"},
+		"/admin/api/repair":                         {"post"},
+		"/admin/api/declarative/apply":              {"post"},
 	} {
 		pathItem := map[string]any{}
 		for _, operation := range operations {

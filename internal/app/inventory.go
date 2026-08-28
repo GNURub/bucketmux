@@ -33,11 +33,12 @@ func (s *Service) TestProviderConnection(ctx context.Context, providerID string)
 	if err != nil {
 		return domain.ProviderHealth{}, err
 	}
-	account, adapter, err := s.providerForReplica(ctx, account)
+	validation, err := s.ValidateProvider(ctx, account)
 	if err != nil {
 		return domain.ProviderHealth{}, err
 	}
-	return adapter.Health(ctx, account), nil
+	s.recordProviderHealth(ctx, account, validation.Health)
+	return validation.Health, nil
 }
 
 func (s *Service) DiscoverProviderBuckets(ctx context.Context, providerID string) ([]domain.ProviderBucket, error) {

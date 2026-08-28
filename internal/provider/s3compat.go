@@ -41,7 +41,8 @@ func (a *S3CompatAdapter) Put(ctx context.Context, account domain.ProviderAccoun
 	if err != nil {
 		return domain.StoredObject{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, body)
+	hash := sha256.New()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, io.TeeReader(body, hash))
 	if err != nil {
 		return domain.StoredObject{}, err
 	}
@@ -51,19 +52,26 @@ func (a *S3CompatAdapter) Put(ctx context.Context, account domain.ProviderAccoun
 	if input.ContentType != "" {
 		req.Header.Set("Content-Type", input.ContentType)
 	}
+	if input.ChecksumSHA256 != "" {
+		req.Header.Set("X-Amz-Meta-Bucketmux-Sha256", input.ChecksumSHA256)
+	}
 	signRequest(req, account, unsignedPayloadHash)
 	res, err := a.client.Do(req)
 	if err != nil {
-		return domain.StoredObject{}, fmt.Errorf("put s3-compatible object: %w", err)
+		return domain.StoredObject{}, &Error{Op: "put s3-compatible object", Kind: FailureUnavailable, Err: err}
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
-		return domain.StoredObject{}, fmt.Errorf("put s3-compatible object failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
+		return domain.StoredObject{}, HTTPError("put s3-compatible object", res, string(body))
 	}
 	etag := res.Header.Get("ETag")
 	if etag == "" {
 		etag = `"streamed-upload"`
+	}
+	checksum := input.ChecksumSHA256
+	if checksum == "" {
+		checksum = hex.EncodeToString(hash.Sum(nil))
 	}
 	return domain.StoredObject{
 		ProviderAccountID: account.ID,
@@ -72,6 +80,7 @@ func (a *S3CompatAdapter) Put(ctx context.Context, account domain.ProviderAccoun
 		Size:              input.Size,
 		ContentType:       input.ContentType,
 		ETag:              etag,
+		ChecksumSHA256:    checksum,
 	}, nil
 }
 
@@ -87,11 +96,12 @@ func (a *S3CompatAdapter) Get(ctx context.Context, account domain.ProviderAccoun
 	signRequest(req, account, emptyPayloadHash)
 	res, err := a.client.Do(req)
 	if err != nil {
-		return nil, obj, fmt.Errorf("get s3-compatible object: %w", err)
+		return nil, obj, &Error{Op: "get s3-compatible object", Kind: FailureUnavailable, Err: err}
 	}
 	if res.StatusCode != http.StatusOK {
 		defer func() { _ = res.Body.Close() }()
-		return nil, obj, fmt.Errorf("get s3-compatible object failed: status=%d", res.StatusCode)
+		responseBody, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return nil, obj, HTTPError("get s3-compatible object", res, string(responseBody))
 	}
 	return res.Body, obj, nil
 }
@@ -108,15 +118,17 @@ func (a *S3CompatAdapter) Head(ctx context.Context, account domain.ProviderAccou
 	signRequest(req, account, emptyPayloadHash)
 	res, err := a.client.Do(req)
 	if err != nil {
-		return obj, fmt.Errorf("head s3-compatible object: %w", err)
+		return obj, &Error{Op: "head s3-compatible object", Kind: FailureUnavailable, Err: err}
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != http.StatusOK {
-		return obj, fmt.Errorf("head s3-compatible object failed: status=%d", res.StatusCode)
+		responseBody, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return obj, HTTPError("head s3-compatible object", res, string(responseBody))
 	}
 	obj.ETag = res.Header.Get("ETag")
 	obj.ContentType = res.Header.Get("Content-Type")
 	obj.Size = res.ContentLength
+	obj.ChecksumSHA256 = res.Header.Get("X-Amz-Meta-Bucketmux-Sha256")
 	return obj, nil
 }
 
@@ -132,13 +144,21 @@ func (a *S3CompatAdapter) Delete(ctx context.Context, account domain.ProviderAcc
 	signRequest(req, account, emptyPayloadHash)
 	res, err := a.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("delete s3-compatible object: %w", err)
+		return &Error{Op: "delete s3-compatible object", Kind: FailureUnavailable, Err: err}
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
-		return fmt.Errorf("delete s3-compatible object failed: status=%d", res.StatusCode)
+		responseBody, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+		return HTTPError("delete s3-compatible object", res, string(responseBody))
 	}
 	return nil
+}
+
+func (a *S3CompatAdapter) Capabilities(domain.ProviderAccount) domain.ProviderCapabilities {
+	return domain.ProviderCapabilities{
+		ListObjects: true, DiscoverBuckets: true, Checksums: true,
+		Limitations: []string{"The S3 protocol does not expose a portable account quota; capacity is configured and usage is reconciled from object inventory."},
+	}
 }
 
 func (a *S3CompatAdapter) Health(ctx context.Context, account domain.ProviderAccount) domain.ProviderHealth {
@@ -209,12 +229,12 @@ func (a *S3CompatAdapter) DiscoverBuckets(ctx context.Context, account domain.Pr
 	signRequest(req, account, emptyPayloadHash)
 	res, err := a.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("discover s3-compatible buckets: %w", err)
+		return nil, &Error{Op: "discover s3-compatible buckets", Kind: FailureUnavailable, Err: err}
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
-		return nil, fmt.Errorf("discover s3-compatible buckets failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
+		return nil, HTTPError("discover s3-compatible buckets", res, string(body))
 	}
 	var decoded s3ListBucketsResult
 	if err := xml.NewDecoder(res.Body).Decode(&decoded); err != nil {
@@ -257,12 +277,12 @@ func (a *S3CompatAdapter) ListObjects(ctx context.Context, account domain.Provid
 	signRequest(req, account, emptyPayloadHash)
 	res, err := a.client.Do(req)
 	if err != nil {
-		return domain.ProviderObjectPage{}, fmt.Errorf("list s3-compatible objects: %w", err)
+		return domain.ProviderObjectPage{}, &Error{Op: "list s3-compatible objects", Kind: FailureUnavailable, Err: err}
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
-		return domain.ProviderObjectPage{}, fmt.Errorf("list s3-compatible objects failed: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
+		return domain.ProviderObjectPage{}, HTTPError("list s3-compatible objects", res, string(body))
 	}
 	var decoded s3ListObjectsResult
 	if err := xml.NewDecoder(res.Body).Decode(&decoded); err != nil {

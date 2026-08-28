@@ -9,6 +9,7 @@ instance_a_port="${MULTI_A_PORT:-18082}"
 instance_b_port="${MULTI_B_PORT:-18083}"
 proxy_port="${MULTI_PROXY_PORT:-18084}"
 restore_port="${MULTI_RESTORE_PORT:-18085}"
+postgres_port="${MULTI_POSTGRES_PORT:-15432}"
 repo_root="$(pwd)"
 playwright_dir="$repo_root/test/e2e/uppy"
 access_key="multi-instance-access"
@@ -189,6 +190,13 @@ docker compose --project-name "$compose_project" --file "$compose_file" up --det
 docker compose --project-name "$compose_project" --file "$compose_file" exec --no-TTY ministack awslocal s3api create-bucket --bucket "$remote_bucket"
 docker compose --project-name "$compose_project" --file "$compose_file" exec --no-TTY ministack-replica awslocal s3api create-bucket --bucket "$replica_bucket"
 docker compose --project-name "$compose_project" --file "$compose_file" up --build --detach --wait bucketmux-a bucketmux-b proxy
+
+BUCKETMUX_RUN_POSTGRES_INTEGRATION=1 \
+BUCKETMUX_EXPECT_PGVECTOR=1 \
+POSTGRES_DSN="postgres://bucketmux:multi-instance-postgres@127.0.0.1:${postgres_port}/bucketmux?sslmode=disable" \
+GOCACHE=/tmp/go-build \
+GOMODCACHE=/tmp/go/pkg/mod \
+go test ./internal/store -run '^TestPostgresAtomicQuotaAcrossInstances$' -count=1 -v
 
 BUCKETMUX_RUN_MULTI_INSTANCE_E2E=1 \
 MULTI_A_ENDPOINT="http://127.0.0.1:${instance_a_port}" \

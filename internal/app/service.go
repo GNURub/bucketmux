@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -19,14 +21,16 @@ import (
 	"github.com/gnurub/bucketmux/internal/provider"
 	placement "github.com/gnurub/bucketmux/internal/router"
 	"github.com/gnurub/bucketmux/internal/store"
+	"github.com/gnurub/bucketmux/internal/wasmplugin"
 )
 
 type Service struct {
-	Store     *store.Store
-	Secrets   *secretcrypto.SecretBox
-	Providers *provider.Registry
-	Router    *placement.PlacementRouter
-	Config    config.Config
+	Store       *store.Store
+	Secrets     *secretcrypto.SecretBox
+	Providers   *provider.Registry
+	Router      *placement.PlacementRouter
+	Config      config.Config
+	WASMRuntime wasmplugin.Executor
 
 	Coordinator     coordination.Coordinator
 	WorkerLeaseTTL  time.Duration
@@ -37,6 +41,7 @@ type Service struct {
 	replicationWake chan struct{}
 	inventoryWake   chan struct{}
 	repairWake      chan struct{}
+	wasmPluginWake  chan struct{}
 	workerState     workerRuntimeState
 	cancelWorkers   context.CancelFunc
 	workerWG        sync.WaitGroup
@@ -77,11 +82,13 @@ func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 		Providers: provider.NewRegistry(
 			provider.Entry(domain.ProviderKindLocal, provider.NewLocalAdapter(cfg.Server.DataDir)),
 			provider.Entry(domain.ProviderKindS3Compat, provider.NewS3CompatAdapter()),
+			provider.Entry(domain.ProviderKindAzureBlob, provider.NewAzureBlobAdapter()),
 			provider.Entry(domain.ProviderKindCloudinary, provider.NewCloudinaryAdapter()),
 			provider.Entry(domain.ProviderKindVercelBlob, provider.NewVercelBlobAdapter()),
 		),
-		Router: placement.NewPlacementRouter(db),
-		Config: cfg,
+		Router:      placement.NewPlacementRouter(db),
+		Config:      cfg,
+		WASMRuntime: wasmplugin.NewRuntime(cfg.Server.DataDir),
 
 		Coordinator:     coordinator,
 		WorkerLeaseTTL:  time.Duration(cfg.Coordination.Redis.LeaseTTLSeconds) * time.Second,
@@ -91,12 +98,17 @@ func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 		replicationWake: make(chan struct{}, 1),
 		inventoryWake:   make(chan struct{}, 1),
 		repairWake:      make(chan struct{}, 1),
+		wasmPluginWake:  make(chan struct{}, 1),
 		workerState:     newWorkerRuntimeState(),
 		cancelWorkers:   cancelWorkers,
 	}
 	if err := svc.Bootstrap(ctx, cfg); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if _, err := svc.Store.RecoverExpiredProviderReservations(ctx, time.Now().UTC()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("recover provider reservations: %w", err)
 	}
 	svc.workerWG.Go(func() {
 		svc.StartHookDeliveryWorker(workerCtx)
@@ -116,6 +128,14 @@ func NewService(ctx context.Context, cfg config.Config) (*Service, error) {
 	svc.workerWG.Go(func() {
 		svc.StartLifecycleWorker(workerCtx)
 	})
+	svc.workerWG.Go(func() {
+		svc.StartQuotaReconciliationWorker(workerCtx)
+	})
+	if cfg.WASMPlugins.Enabled {
+		svc.workerWG.Go(func() {
+			svc.StartWASMPluginWorker(workerCtx)
+		})
+	}
 	return svc, nil
 }
 
@@ -235,24 +255,62 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 	if input.RetentionMode != "" && !input.RetainUntil.After(time.Now().UTC()) {
 		return domain.ObjectRecord{}, fmt.Errorf("retain-until date must be in the future")
 	}
-	primary, err := s.Router.Choose(ctx, input, nil)
+	spool, cleanup, err := s.spoolUpload(body)
 	if err != nil {
 		return domain.ObjectRecord{}, err
 	}
-	targets := replicaTargets(bucket, primary.ID)
-	source := io.Reader(body)
-	var cleanup func()
-	if len(targets) > 0 {
-		source, cleanup, err = s.spoolUpload(body)
+	defer cleanup()
+	input.Size = spool.size
+	input.ChecksumSHA256 = spool.checksumSHA256
+
+	excluded := map[string]bool{}
+	var primary domain.ProviderAccount
+	var stored domain.StoredObject
+	for {
+		primary, err = s.Router.Choose(ctx, input, excluded)
 		if err != nil {
 			return domain.ObjectRecord{}, err
 		}
-		defer cleanup()
+		reservation := domain.ProviderReservation{ID: randomIdentifier("res-", 12), ProviderAccountID: primary.ID, Bytes: input.Size, ExpiresAt: time.Now().UTC().Add(time.Hour)}
+		margin := intSetting(primary.Settings, "quota_margin_bytes")
+		if minFree := intSetting(primary.Settings, "min_free_bytes"); minFree > margin {
+			margin = minFree
+		}
+		reserved, reserveErr := s.Store.ReserveProviderCapacity(ctx, reservation, margin, intSetting(primary.Settings, "monthly_upload_quota_bytes"), time.Now().UTC().Format("2006-01"))
+		if reserveErr != nil {
+			return domain.ObjectRecord{}, fmt.Errorf("reserve provider capacity: %w", reserveErr)
+		}
+		if !reserved {
+			excluded[primary.ID] = true
+			continue
+		}
+		if err := spool.rewind(); err != nil {
+			_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
+			return domain.ObjectRecord{}, err
+		}
+		stored, err = s.putOnProvider(ctx, primary, input, spool.file)
+		if err != nil {
+			_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
+			s.recordProviderWriteFailure(ctx, primary, err)
+			if provider.FailoverEligible(err) {
+				excluded[primary.ID] = true
+				continue
+			}
+			return domain.ObjectRecord{}, err
+		}
+		if err := s.Store.CommitProviderReservation(ctx, reservation.ID, stored.Size); err != nil {
+			_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
+			if account, adapter, adapterErr := s.providerForReplica(ctx, primary); adapterErr == nil {
+				_ = adapter.Delete(ctx, account, domain.ObjectRecord{ProviderAccountID: primary.ID, RemoteBucket: stored.RemoteBucket, RemoteKey: stored.RemoteKey, Size: stored.Size})
+			}
+			return domain.ObjectRecord{}, fmt.Errorf("commit provider reservation: %w", err)
+		}
+		break
 	}
-	stored, err := s.putOnProvider(ctx, primary, input, source)
-	if err != nil {
-		return domain.ObjectRecord{}, err
+	if stored.ChecksumSHA256 == "" {
+		stored.ChecksumSHA256 = input.ChecksumSHA256
 	}
+	targets := replicaTargets(bucket, primary.ID)
 	replicaStatus := "none"
 	if len(targets) > 0 {
 		replicaStatus = "pending"
@@ -290,6 +348,11 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 	if err := s.Store.PutObject(ctx, obj); err != nil {
 		return domain.ObjectRecord{}, err
 	}
+	// An overwrite creates a new object generation. Never expose embeddings
+	// produced from the previous bytes while the new plugin job is pending.
+	if err := s.Store.DeleteObjectEmbeddings(ctx, obj.Bucket, obj.Key); err != nil {
+		return domain.ObjectRecord{}, fmt.Errorf("invalidate object embeddings: %w", err)
+	}
 	if err := s.Store.PutObjectAttributes(ctx, obj); err != nil {
 		return domain.ObjectRecord{}, err
 	}
@@ -298,7 +361,6 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 			return domain.ObjectRecord{}, err
 		}
 	}
-	_ = s.Store.AddProviderUsage(ctx, primary.ID, stored.Size)
 	if existingErr == nil && !bucket.VersioningEnabled {
 		_ = s.cleanupOverwrittenObject(ctx, existing, obj)
 	}
@@ -309,6 +371,11 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 		_ = s.enqueueObjectReplicas(ctx, obj, targets)
 	}
 	s.dispatchObjectHook(ctx, domain.HookEventObjectCreated, obj)
+	if s.Config.WASMPlugins.Enabled && !input.SkipWASMPipelines {
+		if err := s.enqueueWASMPlugins(ctx, domain.WASMPluginEventObjectCreated, obj); err != nil {
+			s.recordWorkerFailure("wasm-plugins", fmt.Errorf("enqueue object %s/%s: %w", obj.Bucket, obj.Key, err))
+		}
+	}
 	return obj, nil
 }
 
@@ -440,6 +507,9 @@ func objectRecordForReplica(primary domain.ObjectRecord, replica domain.ObjectRe
 	if replica.ETag != "" {
 		primary.ETag = replica.ETag
 	}
+	if replica.ChecksumSHA256 != "" {
+		primary.ChecksumSHA256 = replica.ChecksumSHA256
+	}
 	return primary
 }
 
@@ -499,7 +569,20 @@ func (s *Service) UpsertProviderFromAdmin(ctx context.Context, account domain.Pr
 	} else if existing, err := s.Store.GetProvider(ctx, account.ID); err == nil {
 		account.SecretEncrypted = existing.SecretEncrypted
 	}
-	return s.Store.UpsertProvider(ctx, account)
+	validation, err := s.ValidateProvider(ctx, account)
+	if err != nil {
+		return err
+	}
+	if account.Enabled && validation.Health.Status != domain.ProviderHealthHealthy {
+		return fmt.Errorf("provider cannot be enabled before onboarding succeeds: %s", validation.Health.Message)
+	}
+	if err := s.Store.UpsertProvider(ctx, account); err != nil {
+		return err
+	}
+	if account.Enabled {
+		s.recordProviderHealth(ctx, account, validation.Health)
+	}
+	return nil
 }
 
 func (s *Service) putOnProvider(ctx context.Context, account domain.ProviderAccount, input domain.PutObjectInput, body io.Reader) (domain.StoredObject, error) {
@@ -558,7 +641,20 @@ func (s *Service) ensureBucket(ctx context.Context, name string) (domain.Bucket,
 	return domain.Bucket{}, err
 }
 
-func (s *Service) spoolUpload(body io.Reader) (io.ReadSeeker, func(), error) {
+type uploadSpool struct {
+	file           *os.File
+	size           int64
+	checksumSHA256 string
+}
+
+func (spool *uploadSpool) rewind() error {
+	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind upload spool: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) spoolUpload(body io.Reader) (*uploadSpool, func(), error) {
 	file, err := os.CreateTemp(s.Config.Server.DataDir, "bucketmux-upload-*.tmp")
 	if err != nil {
 		return nil, nil, fmt.Errorf("create upload spool: %w", err)
@@ -568,15 +664,22 @@ func (s *Service) spoolUpload(body io.Reader) (io.ReadSeeker, func(), error) {
 		_ = file.Close()
 		_ = os.Remove(name)
 	}
-	if _, err := io.Copy(file, body); err != nil {
+	hash := sha256.New()
+	written, err := io.Copy(file, io.TeeReader(io.LimitReader(body, s.Config.Server.MaxUploadBytes+1), hash))
+	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("spool upload: %w", err)
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	if written > s.Config.Server.MaxUploadBytes {
 		cleanup()
-		return nil, nil, fmt.Errorf("rewind upload spool: %w", err)
+		return nil, nil, fmt.Errorf("%w: maximum is %d bytes", ErrUploadTooLarge, s.Config.Server.MaxUploadBytes)
 	}
-	return file, cleanup, nil
+	spool := &uploadSpool{file: file, size: written, checksumSHA256: hex.EncodeToString(hash.Sum(nil))}
+	if err := spool.rewind(); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return spool, cleanup, nil
 }
 
 func replicaTargets(bucket domain.Bucket, primaryProviderID string) []string {
