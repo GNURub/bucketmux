@@ -11,7 +11,7 @@ fn main() {
         "other"
     };
     print!(
-        "{{\"abi_version\":\"bucketmux.wasm.v1\",\"metadata\":{{\"classifier\":\"rust-rule-demo-v1\"}},\"tags\":{{\"media-category\":\"{}\"}}}}",
+        "{{\"abi_version\":\"bucketmux.wasm.v1\",\"metadata\":{{\"classifier\":\"rust-rule-demo-v1\"}},\"tags\":{{\"media-category\":\"{}\"}},\"operations\":[{{\"id\":\"classification-metadata\",\"type\":\"metadata.patch\",\"metadata\":{{\"classification-state\":\"complete\"}},\"remove_metadata\":[\"classification-pending\"]}}]}}",
         category
     );
 }

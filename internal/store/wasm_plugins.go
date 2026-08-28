@@ -29,9 +29,13 @@ func (s *Store) UpsertWASMPlugin(ctx context.Context, plugin domain.WASMPlugin) 
 	if err != nil {
 		return fmt.Errorf("encode plugin config: %w", err)
 	}
+	operationPolicy, err := json.Marshal(plugin.OperationPolicy)
+	if err != nil {
+		return fmt.Errorf("encode plugin operation policy: %w", err)
+	}
 	_, err = s.exec(ctx, `
-INSERT INTO wasm_plugins (id, name, description, abi_version, module_base64, module_sha256, events_json, bucket_pattern, key_prefix, key_suffix, content_types_json, config_json, enabled, timeout_millis, memory_limit_bytes, max_input_bytes, max_output_bytes, max_attempts, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO wasm_plugins (id, name, description, abi_version, module_base64, module_sha256, events_json, bucket_pattern, key_prefix, key_suffix, content_types_json, config_json, operation_policy_json, enabled, timeout_millis, memory_limit_bytes, max_input_bytes, max_output_bytes, max_attempts, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   name=excluded.name,
   description=excluded.description,
@@ -44,6 +48,7 @@ ON CONFLICT(id) DO UPDATE SET
   key_suffix=excluded.key_suffix,
   content_types_json=excluded.content_types_json,
   config_json=excluded.config_json,
+  operation_policy_json=excluded.operation_policy_json,
   enabled=excluded.enabled,
   timeout_millis=excluded.timeout_millis,
   memory_limit_bytes=excluded.memory_limit_bytes,
@@ -51,7 +56,7 @@ ON CONFLICT(id) DO UPDATE SET
   max_output_bytes=excluded.max_output_bytes,
   max_attempts=excluded.max_attempts,
   updated_at=excluded.updated_at
-`, plugin.ID, plugin.Name, plugin.Description, plugin.ABIVersion, plugin.ModuleBase64, plugin.ModuleSHA256, string(events), plugin.BucketPattern, plugin.KeyPrefix, plugin.KeySuffix, string(contentTypes), string(pluginConfig), boolToInt(plugin.Enabled), plugin.TimeoutMillis, plugin.MemoryLimitBytes, plugin.MaxInputBytes, plugin.MaxOutputBytes, plugin.MaxAttempts, plugin.CreatedAt.Format(time.RFC3339Nano), plugin.UpdatedAt.Format(time.RFC3339Nano))
+`, plugin.ID, plugin.Name, plugin.Description, plugin.ABIVersion, plugin.ModuleBase64, plugin.ModuleSHA256, string(events), plugin.BucketPattern, plugin.KeyPrefix, plugin.KeySuffix, string(contentTypes), string(pluginConfig), string(operationPolicy), boolToInt(plugin.Enabled), plugin.TimeoutMillis, plugin.MemoryLimitBytes, plugin.MaxInputBytes, plugin.MaxOutputBytes, plugin.MaxAttempts, plugin.CreatedAt.Format(time.RFC3339Nano), plugin.UpdatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("upsert wasm plugin: %w", err)
 	}
@@ -208,13 +213,13 @@ func (s *Store) RecoverStaleWASMPluginJobs(ctx context.Context, cutoff time.Time
 	return result.RowsAffected()
 }
 
-const wasmPluginSelect = `SELECT id, name, description, abi_version, module_base64, module_sha256, events_json, bucket_pattern, key_prefix, key_suffix, content_types_json, config_json, enabled, timeout_millis, memory_limit_bytes, max_input_bytes, max_output_bytes, max_attempts, created_at, updated_at FROM wasm_plugins`
+const wasmPluginSelect = `SELECT id, name, description, abi_version, module_base64, module_sha256, events_json, bucket_pattern, key_prefix, key_suffix, content_types_json, config_json, operation_policy_json, enabled, timeout_millis, memory_limit_bytes, max_input_bytes, max_output_bytes, max_attempts, created_at, updated_at FROM wasm_plugins`
 
 func scanWASMPlugin(row scanner) (domain.WASMPlugin, error) {
 	var plugin domain.WASMPlugin
-	var eventsJSON, contentTypesJSON, configJSON, created, updated string
+	var eventsJSON, contentTypesJSON, configJSON, operationPolicyJSON, created, updated string
 	var enabled int
-	if err := row.Scan(&plugin.ID, &plugin.Name, &plugin.Description, &plugin.ABIVersion, &plugin.ModuleBase64, &plugin.ModuleSHA256, &eventsJSON, &plugin.BucketPattern, &plugin.KeyPrefix, &plugin.KeySuffix, &contentTypesJSON, &configJSON, &enabled, &plugin.TimeoutMillis, &plugin.MemoryLimitBytes, &plugin.MaxInputBytes, &plugin.MaxOutputBytes, &plugin.MaxAttempts, &created, &updated); err != nil {
+	if err := row.Scan(&plugin.ID, &plugin.Name, &plugin.Description, &plugin.ABIVersion, &plugin.ModuleBase64, &plugin.ModuleSHA256, &eventsJSON, &plugin.BucketPattern, &plugin.KeyPrefix, &plugin.KeySuffix, &contentTypesJSON, &configJSON, &operationPolicyJSON, &enabled, &plugin.TimeoutMillis, &plugin.MemoryLimitBytes, &plugin.MaxInputBytes, &plugin.MaxOutputBytes, &plugin.MaxAttempts, &created, &updated); err != nil {
 		return plugin, err
 	}
 	if err := json.Unmarshal([]byte(eventsJSON), &plugin.Events); err != nil {
@@ -224,6 +229,9 @@ func scanWASMPlugin(row scanner) (domain.WASMPlugin, error) {
 		return plugin, err
 	}
 	if err := json.Unmarshal([]byte(configJSON), &plugin.Config); err != nil {
+		return plugin, err
+	}
+	if err := json.Unmarshal([]byte(operationPolicyJSON), &plugin.OperationPolicy); err != nil {
 		return plugin, err
 	}
 	plugin.Enabled = enabled != 0

@@ -36,5 +36,6 @@ describe("BucketMux AssemblyScript guest", () => {
     const result = JSON.parse(output);
     expect(result.abi_version).toBe("bucketmux.wasm.v1");
     expect(result.tags["media-category"]).toBe("image");
+    expect(result.operations[0].type).toBe("tags.patch");
   });
 });

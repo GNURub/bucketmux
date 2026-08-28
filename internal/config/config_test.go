@@ -59,8 +59,8 @@ func TestLoadDefaultsToSQLiteStoreBackedByTurso(t *testing.T) {
 	if cfg.Store.SQLite.Path != cfg.Server.DBPath {
 		t.Fatalf("Store.SQLite.Path = %q, Server.DBPath = %q", cfg.Store.SQLite.Path, cfg.Server.DBPath)
 	}
-	if cfg.Store.SQLite.MaxOpenConns != 10 || cfg.Store.SQLite.MaxIdleConns != 10 {
-		t.Fatalf("Store.SQLite pool = %+v, want 10 open and 10 idle connections", cfg.Store.SQLite)
+	if cfg.Store.SQLite.MaxOpenConns != 4 || cfg.Store.SQLite.MaxIdleConns != 4 {
+		t.Fatalf("Store.SQLite pool = %+v, want 4 open and 4 idle connections", cfg.Store.SQLite)
 	}
 }
 

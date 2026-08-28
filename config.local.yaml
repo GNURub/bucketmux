@@ -14,8 +14,8 @@ store:
   kind: "sqlite"
   sqlite:
     path: "./data/switcher.db"
-    max_open_conns: 10
-    max_idle_conns: 10
+    max_open_conns: 4
+    max_idle_conns: 4
   postgres:
     dsn: "postgres://bucketmux:bucketmux@localhost:5432/bucketmux?sslmode=disable"
     max_open_conns: 25

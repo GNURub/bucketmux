@@ -90,13 +90,14 @@ func TestWASMPluginAdminAPIInstallsRustGuest(t *testing.T) {
 	payload, _ := json.Marshal(map[string]any{
 		"id": "rust-classifier", "name": "Rust classifier", "module_base64": base64.StdEncoding.EncodeToString(module),
 		"events": []string{domain.WASMPluginEventObjectCreated}, "bucket_pattern": "images", "content_types": []string{"image/*"}, "enabled": true,
+		"operation_policy": map[string]any{"allowed_operations": []string{domain.WASMPluginOperationMetadataPatch}, "max_operations": 4},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/admin/api/wasm-plugins", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth("admin", "change-me")
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
-	if res.Code != http.StatusCreated || strings.Contains(res.Body.String(), "module_base64") || !strings.Contains(res.Body.String(), "module_sha256") {
+	if res.Code != http.StatusCreated || strings.Contains(res.Body.String(), "module_base64") || !strings.Contains(res.Body.String(), "module_sha256") || !strings.Contains(res.Body.String(), domain.WASMPluginOperationMetadataPatch) {
 		t.Fatalf("install status=%d body=%s", res.Code, res.Body.String())
 	}
 

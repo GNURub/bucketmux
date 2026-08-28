@@ -1913,7 +1913,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
           <div class="card-body table-wrap">
             {{if .WASMPlugins}}
             <table class="table"><thead><tr><th>Plugin</th><th>Selectors</th><th>Limits</th><th>Module</th><th>Status</th></tr></thead><tbody>
-            {{range .WASMPlugins}}<tr><td><span class="name">{{.Name}}</span><span class="sub mono">{{.ID}} · {{.ABIVersion}}</span></td><td><span class="mono">{{.BucketPattern}}/{{.KeyPrefix}}*{{.KeySuffix}}</span><span class="sub">{{join .ContentTypes ", "}}</span></td><td><span class="mono">{{.TimeoutMillis}} ms · {{formatBytes .MemoryLimitBytes}}</span><span class="sub">input/output {{formatBytes .MaxInputBytes}} / {{formatBytes .MaxOutputBytes}}</span></td><td><span class="mono">sha256:{{.ModuleSHA256}}</span></td><td>{{if .Enabled}}<span class="pill enabled">enabled</span>{{else}}<span class="pill disabled">disabled</span>{{end}}</td></tr>{{end}}
+            {{range .WASMPlugins}}<tr><td><span class="name">{{.Name}}</span><span class="sub mono">{{.ID}} · {{.ABIVersion}}</span></td><td><span class="mono">{{.BucketPattern}}/{{.KeyPrefix}}*{{.KeySuffix}}</span><span class="sub">{{join .ContentTypes ", "}}</span></td><td><span class="mono">{{.TimeoutMillis}} ms · {{formatBytes .MemoryLimitBytes}}</span><span class="sub">input/output {{formatBytes .MaxInputBytes}} / {{formatBytes .MaxOutputBytes}}</span><span class="sub">operations: {{if .OperationPolicy.AllowedOperations}}{{join .OperationPolicy.AllowedOperations ", "}} · max {{.OperationPolicy.MaxOperations}}{{else}}none{{end}}</span></td><td><span class="mono">sha256:{{.ModuleSHA256}}</span></td><td>{{if .Enabled}}<span class="pill enabled">enabled</span>{{else}}<span class="pill disabled">disabled</span>{{end}}</td></tr>{{end}}
             </tbody></table>{{else}}<div class="empty">No WASM plugins installed. The Rust and Bun 1.4 examples under <span class="mono">examples/wasm</span> implement the ABI.</div>{{end}}
           </div>
         </section>
@@ -2079,7 +2079,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
         </section>
 
         <section id="audit-card" class="card" data-search-section>
-          <div class="card-header"><div><h2 class="card-title">Audit log</h2><p class="card-desc">Destructive and move operations initiated from the admin.</p></div></div>
+          <div class="card-header"><div><h2 class="card-title">Audit log</h2><p class="card-desc">Destructive, move, and scoped WASM bucket operations.</p></div></div>
           <div class="card-body table-wrap">
             {{if .AuditEvents}}
             <table class="table">

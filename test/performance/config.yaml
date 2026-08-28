@@ -8,8 +8,8 @@ store:
   kind: "sqlite"
   sqlite:
     path: "./data/bucketmux.db"
-    max_open_conns: 10
-    max_idle_conns: 10
+    max_open_conns: 4
+    max_idle_conns: 4
 
 s3:
   access_key: "k6-access-key"

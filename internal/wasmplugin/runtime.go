@@ -141,6 +141,7 @@ func (r *Runtime) Execute(ctx context.Context, module []byte, plugin domain.WASM
 	invocation.ABIVersion = domain.WASMPluginABIV1
 	invocation.Object.InputPath = "/input/object"
 	invocation.Workspace.OutputDir = "/output"
+	invocation.Capabilities.Operations = plugin.OperationPolicy
 	requestJSON, err := json.Marshal(invocation)
 	if err != nil {
 		return fail(fmt.Errorf("encode plugin invocation: %w", err))
@@ -193,6 +194,9 @@ func (r *Runtime) Execute(ctx context.Context, module []byte, plugin domain.WASM
 	}
 	if execution.Result.ABIVersion != domain.WASMPluginABIV1 {
 		return fail(fmt.Errorf("plugin result abi_version %q does not match %q", execution.Result.ABIVersion, domain.WASMPluginABIV1))
+	}
+	if err := ValidateOperations(plugin, invocation.Object, execution.Result.Operations); err != nil {
+		return fail(err)
 	}
 	if len(execution.Result.DerivedObjects) > maxDerivedObjects {
 		return fail(fmt.Errorf("plugin declared %d derived objects; maximum is %d", len(execution.Result.DerivedObjects), maxDerivedObjects))

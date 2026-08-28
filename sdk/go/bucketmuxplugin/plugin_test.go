@@ -30,3 +30,20 @@ func TestRunRejectsUnknownABI(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestRunExposesCapabilitiesAndEncodesOperations(t *testing.T) {
+	input := `{"abi_version":"bucketmux.wasm.v1","object":{"bucket":"photos","key":"a.jpg","input_path":"/input/object"},"capabilities":{"operations":{"allowed_operations":["metadata.patch"],"max_operations":2}}}`
+	var output bytes.Buffer
+	err := Run(context.Background(), strings.NewReader(input), &output, func(_ context.Context, invocation Invocation) (Result, error) {
+		if invocation.Capabilities.Operations.MaxOperations != 2 {
+			t.Fatalf("capabilities = %+v", invocation.Capabilities)
+		}
+		return Result{Operations: []Operation{{ID: "classify", Type: OperationMetadataPatch, Metadata: map[string]string{"category": "portrait"}}}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"operations":[{"id":"classify","type":"metadata.patch"`) {
+		t.Fatalf("unexpected output: %s", output.String())
+	}
+}

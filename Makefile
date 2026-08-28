@@ -68,4 +68,4 @@ test-wasm-plugins:
 	./examples/wasm/go/build.sh
 	./examples/wasm/rust/build.sh
 	cd examples/wasm/bun-assemblyscript && bun install --frozen-lockfile && bun run build && bun test
-	BUCKETMUX_RUN_WASM_EXAMPLES=1 GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go/pkg/mod go test ./internal/wasmplugin ./internal/app ./internal/admin -run 'TestGoBuiltWASMExamples|TestRustAndBunBuiltWASMExamples|TestGoEmbeddingPipelineSingleAndMultipleInstances|TestWASMPipelineSingleAndMultipleInstances|TestWASMPluginAdminAPIInstallsRustGuest|TestEmbeddingAdminAPIListsWithoutValuesAndSearches' -count=1 -v
+	BUCKETMUX_RUN_WASM_EXAMPLES=1 GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go/pkg/mod go test ./internal/wasmplugin ./internal/app ./internal/admin -run 'TestGoBuiltWASMExamples|TestRustAndBunBuiltWASMExamples|TestGoEmbeddingPipelineSingleAndMultipleInstances|TestWASMPipelineSingleAndMultipleInstances|TestWASMDeclarativeBucketOperationsSingleAndMultipleInstances|TestWASMOperationsDenyByDefaultAndRespectObjectLock|TestWASMPluginAdminAPIInstallsRustGuest|TestEmbeddingAdminAPIListsWithoutValuesAndSearches' -count=1 -v

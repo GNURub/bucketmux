@@ -13,6 +13,7 @@ import (
 
 	"github.com/gnurub/bucketmux/internal/config"
 	"github.com/gnurub/bucketmux/internal/domain"
+	"github.com/gnurub/bucketmux/internal/store"
 	"github.com/gnurub/bucketmux/internal/wasmplugin"
 )
 
@@ -88,6 +89,156 @@ type failingWASMExecutor struct{ err error }
 func (failingWASMExecutor) Validate(context.Context, []byte, domain.WASMPlugin) error { return nil }
 func (executor failingWASMExecutor) Execute(context.Context, []byte, domain.WASMPlugin, domain.WASMPluginInvocation, io.Reader) (*wasmplugin.Execution, error) {
 	return nil, executor.err
+}
+
+type staticWASMExecutor struct {
+	result     domain.WASMPluginResult
+	invocation *domain.WASMPluginInvocation
+}
+
+func (staticWASMExecutor) Validate(context.Context, []byte, domain.WASMPlugin) error { return nil }
+func (executor staticWASMExecutor) Execute(_ context.Context, _ []byte, _ domain.WASMPlugin, invocation domain.WASMPluginInvocation, _ io.Reader) (*wasmplugin.Execution, error) {
+	if executor.invocation != nil {
+		*executor.invocation = invocation
+	}
+	return &wasmplugin.Execution{Result: executor.result}, nil
+}
+
+func TestWASMDeclarativeBucketOperationsSingleAndMultipleInstances(t *testing.T) {
+	for _, instanceMode := range []string{"single", "multiple"} {
+		t.Run(instanceMode, func(t *testing.T) {
+			dataDir := t.TempDir()
+			dbPath := filepath.Join(dataDir, instanceMode+".db")
+			writer := newWASMTestService(t, dataDir, dbPath)
+			worker := writer
+			if instanceMode == "multiple" {
+				worker = newWASMTestService(t, dataDir, dbPath)
+			}
+			for _, svc := range []*Service{writer, worker} {
+				if svc.cancelWorkers != nil {
+					svc.cancelWorkers()
+					svc.workerWG.Wait()
+				}
+			}
+			ctx := context.Background()
+			if err := writer.Store.UpsertBucket(ctx, domain.Bucket{Name: "archive"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.PutObject(ctx, domain.PutObjectInput{Bucket: "images", Key: "delete-me.txt", Size: 6, SkipWASMPipelines: true}, strings.NewReader("delete")); err != nil {
+				t.Fatal(err)
+			}
+			plugin := domain.WASMPlugin{
+				ID: "bucket-operator", Name: "Bucket operator", ABIVersion: domain.WASMPluginABIV1,
+				ModuleBase64: base64.StdEncoding.EncodeToString([]byte("module")), Events: []string{domain.WASMPluginEventObjectCreated},
+				BucketPattern: "images", Enabled: true, MaxAttempts: 3,
+				OperationPolicy: domain.WASMPluginOperationPolicy{
+					AllowedOperations: []string{domain.WASMPluginOperationMetadataPatch, domain.WASMPluginOperationTagsPatch, domain.WASMPluginOperationObjectCopy, domain.WASMPluginOperationObjectDelete},
+					BucketPatterns:    []string{"archive"}, MaxOperations: 4,
+				},
+			}
+			if err := writer.Store.UpsertWASMPlugin(ctx, plugin); err != nil {
+				t.Fatal(err)
+			}
+			var invocation domain.WASMPluginInvocation
+			worker.WASMRuntime = staticWASMExecutor{invocation: &invocation, result: domain.WASMPluginResult{
+				ABIVersion: domain.WASMPluginABIV1,
+				Operations: []domain.WASMPluginOperation{
+					{ID: "classify", Type: domain.WASMPluginOperationMetadataPatch, Metadata: map[string]string{"category": "portrait"}, RemoveMetadata: []string{"pending"}},
+					{ID: "tag", Type: domain.WASMPluginOperationTagsPatch, Tags: map[string]string{"reviewed": "true"}},
+					{ID: "archive", Type: domain.WASMPluginOperationObjectCopy, Bucket: "archive", Key: "processed/source.txt", Metadata: map[string]string{"archived-by": "wasm"}},
+					{ID: "cleanup", Type: domain.WASMPluginOperationObjectDelete, Key: "delete-me.txt"},
+				},
+			}}
+			if _, err := writer.PutObject(ctx, domain.PutObjectInput{Bucket: "images", Key: "source.txt", Size: 7, ContentType: "text/plain", Metadata: map[string]string{"pending": "yes"}}, strings.NewReader("payload")); err != nil {
+				t.Fatal(err)
+			}
+			job, claimed, err := worker.Store.ClaimNextWASMPluginJob(ctx, time.Now().UTC().Add(time.Second))
+			if err != nil || !claimed {
+				t.Fatalf("claim = %+v, %v, %v", job, claimed, err)
+			}
+			if err := worker.runWASMPluginJob(ctx, job); err != nil {
+				t.Fatal(err)
+			}
+			if invocation.Capabilities.Operations.MaxOperations != 4 || len(invocation.Capabilities.Operations.AllowedOperations) != 4 {
+				t.Fatalf("invocation capabilities = %+v", invocation.Capabilities)
+			}
+			source, err := writer.Store.GetObject(ctx, "images", "source.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = writer.Store.HydrateObjectAttributes(ctx, &source)
+			if source.Metadata["category"] != "portrait" || source.Metadata["pending"] != "" || source.Tags["reviewed"] != "true" {
+				t.Fatalf("source attributes = metadata=%v tags=%v", source.Metadata, source.Tags)
+			}
+			body, copied, err := writer.GetObject(ctx, "archive", "processed/source.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, readErr := io.ReadAll(body)
+			_ = body.Close()
+			if readErr != nil || string(data) != "payload" || copied.Metadata["archived-by"] != "wasm" || copied.Metadata["category"] != "portrait" {
+				t.Fatalf("copied object = %q %+v, %v", data, copied, readErr)
+			}
+			if _, err := writer.Store.GetObject(ctx, "images", "delete-me.txt"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("deleted object error = %v", err)
+			}
+			jobs, err := writer.Store.ListWASMPluginJobs(ctx, 10)
+			if err != nil || len(jobs) != 1 || jobs[0].Status != domain.WASMPluginStatusSucceeded || !strings.Contains(jobs[0].ResultJSON, `"operations"`) {
+				t.Fatalf("jobs = %+v, %v", jobs, err)
+			}
+			audits, err := writer.Store.ListAuditEvents(ctx, 10)
+			if err != nil || len(audits) != 4 {
+				t.Fatalf("audits = %+v, %v", audits, err)
+			}
+		})
+	}
+}
+
+func TestWASMOperationsDenyByDefaultAndRespectObjectLock(t *testing.T) {
+	dataDir := t.TempDir()
+	svc := newWASMTestService(t, dataDir, filepath.Join(dataDir, "policy.db"))
+	if svc.cancelWorkers != nil {
+		svc.cancelWorkers()
+		svc.workerWG.Wait()
+	}
+	ctx := context.Background()
+	if err := svc.Store.UpsertBucket(ctx, domain.Bucket{Name: "images", ObjectLockEnabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PutObject(ctx, domain.PutObjectInput{
+		Bucket: "images", Key: "locked.txt", Size: 3, RetentionMode: "COMPLIANCE",
+		RetainUntil: time.Now().UTC().Add(time.Hour), SkipWASMPipelines: true,
+	}, strings.NewReader("old")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PutObject(ctx, domain.PutObjectInput{Bucket: "images", Key: "source.txt", Size: 3, SkipWASMPipelines: true}, strings.NewReader("new")); err != nil {
+		t.Fatal(err)
+	}
+	source, err := svc.Store.GetObject(ctx, "images", "source.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := &wasmplugin.Execution{Result: domain.WASMPluginResult{Operations: []domain.WASMPluginOperation{{Type: domain.WASMPluginOperationObjectDelete}}}}
+	if err := svc.applyWASMPluginResult(ctx, domain.WASMPlugin{ID: "unprivileged"}, source, denied); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("denied operation error = %v", err)
+	}
+	if _, err := svc.Store.GetObject(ctx, "images", "source.txt"); err != nil {
+		t.Fatalf("denied delete changed source: %v", err)
+	}
+	copyPlugin := domain.WASMPlugin{ID: "copy", OperationPolicy: domain.WASMPluginOperationPolicy{AllowedOperations: []string{domain.WASMPluginOperationObjectCopy}}}
+	copyResult := &wasmplugin.Execution{Result: domain.WASMPluginResult{Operations: []domain.WASMPluginOperation{{Type: domain.WASMPluginOperationObjectCopy, Key: "locked.txt"}}}}
+	if err := svc.applyWASMPluginResult(ctx, copyPlugin, source, copyResult); err == nil || !errors.Is(err, ErrObjectLocked) {
+		t.Fatalf("protected copy error = %v", err)
+	}
+	body, _, err := svc.GetObject(ctx, "images", "locked.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(body)
+	_ = body.Close()
+	if readErr != nil || string(data) != "old" {
+		t.Fatalf("locked target changed to %q, err=%v", data, readErr)
+	}
 }
 
 func TestWASMPipelineSingleAndMultipleInstances(t *testing.T) {

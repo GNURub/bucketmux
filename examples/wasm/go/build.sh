@@ -7,6 +7,6 @@ mkdir -p "$build_dir"
 export GOCACHE="${GOCACHE:-/tmp/go-build}"
 export GOMODCACHE="${GOMODCACHE:-/tmp/go/pkg/mod}"
 
-for plugin in metadata-tagger image-dimensions embedding-generator; do
+for plugin in metadata-tagger image-dimensions embedding-generator bucket-operator; do
   GOOS=wasip1 GOARCH=wasm go build -trimpath -ldflags="-s -w" -o "$build_dir/$plugin.wasm" "$root_dir/examples/wasm/go/$plugin"
 done

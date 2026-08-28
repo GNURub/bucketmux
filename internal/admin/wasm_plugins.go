@@ -11,32 +11,38 @@ import (
 )
 
 type wasmPluginRequest struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	Description      string            `json:"description"`
-	ABIVersion       string            `json:"abi_version"`
-	ModuleBase64     string            `json:"module_base64"`
-	Events           []string          `json:"events"`
-	BucketPattern    string            `json:"bucket_pattern"`
-	KeyPrefix        string            `json:"key_prefix"`
-	KeySuffix        string            `json:"key_suffix"`
-	ContentTypes     []string          `json:"content_types"`
-	Config           map[string]string `json:"config"`
-	Enabled          bool              `json:"enabled"`
-	TimeoutMillis    int               `json:"timeout_millis"`
-	MemoryLimitBytes int64             `json:"memory_limit_bytes"`
-	MaxInputBytes    int64             `json:"max_input_bytes"`
-	MaxOutputBytes   int64             `json:"max_output_bytes"`
-	MaxAttempts      int               `json:"max_attempts"`
+	ID               string                            `json:"id"`
+	Name             string                            `json:"name"`
+	Description      string                            `json:"description"`
+	ABIVersion       string                            `json:"abi_version"`
+	ModuleBase64     string                            `json:"module_base64"`
+	Events           []string                          `json:"events"`
+	BucketPattern    string                            `json:"bucket_pattern"`
+	KeyPrefix        string                            `json:"key_prefix"`
+	KeySuffix        string                            `json:"key_suffix"`
+	ContentTypes     []string                          `json:"content_types"`
+	Config           map[string]string                 `json:"config"`
+	OperationPolicy  *domain.WASMPluginOperationPolicy `json:"operation_policy"`
+	Enabled          bool                              `json:"enabled"`
+	TimeoutMillis    int                               `json:"timeout_millis"`
+	MemoryLimitBytes int64                             `json:"memory_limit_bytes"`
+	MaxInputBytes    int64                             `json:"max_input_bytes"`
+	MaxOutputBytes   int64                             `json:"max_output_bytes"`
+	MaxAttempts      int                               `json:"max_attempts"`
 }
 
 func (request wasmPluginRequest) toDomain() domain.WASMPlugin {
+	var operationPolicy domain.WASMPluginOperationPolicy
+	if request.OperationPolicy != nil {
+		operationPolicy = *request.OperationPolicy
+	}
 	return domain.WASMPlugin{
 		ID: strings.TrimSpace(request.ID), Name: strings.TrimSpace(request.Name), Description: strings.TrimSpace(request.Description),
 		ABIVersion: request.ABIVersion, ModuleBase64: strings.TrimSpace(request.ModuleBase64), Events: request.Events,
 		BucketPattern: request.BucketPattern, KeyPrefix: request.KeyPrefix, KeySuffix: request.KeySuffix,
 		ContentTypes: request.ContentTypes, Config: request.Config, Enabled: request.Enabled,
-		TimeoutMillis: request.TimeoutMillis, MemoryLimitBytes: request.MemoryLimitBytes,
+		OperationPolicy: operationPolicy,
+		TimeoutMillis:   request.TimeoutMillis, MemoryLimitBytes: request.MemoryLimitBytes,
 		MaxInputBytes: request.MaxInputBytes, MaxOutputBytes: request.MaxOutputBytes, MaxAttempts: request.MaxAttempts,
 	}
 }
@@ -61,6 +67,9 @@ func (h *Handler) wasmPlugins(w http.ResponseWriter, r *http.Request) {
 			existing, err := h.svc.Store.GetWASMPlugin(r.Context(), plugin.ID)
 			if err == nil {
 				plugin.ModuleBase64 = existing.ModuleBase64
+				if request.OperationPolicy == nil {
+					plugin.OperationPolicy = existing.OperationPolicy
+				}
 			}
 		}
 		if err := h.svc.UpsertWASMPlugin(r.Context(), plugin); err != nil {

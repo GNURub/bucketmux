@@ -236,6 +236,7 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 		return domain.ObjectRecord{}, err
 	}
 	existing, existingErr := s.Store.GetObject(ctx, input.Bucket, input.Key)
+	isNewObject := errors.Is(existingErr, store.ErrNotFound)
 	if existingErr == nil {
 		_ = s.Store.HydrateObjectAttributes(ctx, &existing)
 	}
@@ -288,7 +289,7 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 			_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
 			return domain.ObjectRecord{}, err
 		}
-		stored, err = s.putOnProvider(ctx, primary, input, spool.file)
+		stored, err = s.putUploadSpoolOnProvider(ctx, primary, input, spool)
 		if err != nil {
 			_ = s.Store.ReleaseProviderReservation(ctx, reservation.ID)
 			s.recordProviderWriteFailure(ctx, primary, err)
@@ -348,13 +349,18 @@ func (s *Service) PutObject(ctx context.Context, input domain.PutObjectInput, bo
 	if err := s.Store.PutObject(ctx, obj); err != nil {
 		return domain.ObjectRecord{}, err
 	}
-	// An overwrite creates a new object generation. Never expose embeddings
-	// produced from the previous bytes while the new plugin job is pending.
-	if err := s.Store.DeleteObjectEmbeddings(ctx, obj.Bucket, obj.Key); err != nil {
-		return domain.ObjectRecord{}, fmt.Errorf("invalidate object embeddings: %w", err)
+	// Only an overwrite can have embeddings from a previous generation.
+	if !isNewObject {
+		if err := s.Store.DeleteObjectEmbeddings(ctx, obj.Bucket, obj.Key); err != nil {
+			return domain.ObjectRecord{}, fmt.Errorf("invalidate object embeddings: %w", err)
+		}
 	}
-	if err := s.Store.PutObjectAttributes(ctx, obj); err != nil {
-		return domain.ObjectRecord{}, err
+	// A missing attributes row already hydrates to the same empty/default
+	// values. Persist one on first upload only when it carries real state.
+	if !isNewObject || hasPersistentObjectAttributes(obj) {
+		if err := s.Store.PutObjectAttributes(ctx, obj); err != nil {
+			return domain.ObjectRecord{}, err
+		}
 	}
 	if bucket.VersioningEnabled {
 		if err := s.Store.PutObjectVersion(ctx, obj); err != nil {
@@ -523,6 +529,9 @@ func (s *Service) deleteObjectReplicas(ctx context.Context, obj domain.ObjectRec
 	if err != nil {
 		return
 	}
+	if len(replicas) == 0 {
+		return
+	}
 	for _, replica := range replicas {
 		account, err := s.Store.GetProvider(ctx, replica.ProviderAccountID)
 		if err != nil {
@@ -595,6 +604,21 @@ func (s *Service) putOnProvider(ctx context.Context, account domain.ProviderAcco
 		return domain.StoredObject{}, fmt.Errorf("provider kind %s is not registered", account.Kind)
 	}
 	return adapter.Put(ctx, account, input, body)
+}
+
+func (s *Service) putUploadSpoolOnProvider(ctx context.Context, account domain.ProviderAccount, input domain.PutObjectInput, spool *uploadSpool) (domain.StoredObject, error) {
+	account, err := s.decryptAccount(account)
+	if err != nil {
+		return domain.StoredObject{}, err
+	}
+	adapter, ok := s.Providers.Get(account.Kind)
+	if !ok {
+		return domain.StoredObject{}, fmt.Errorf("provider kind %s is not registered", account.Kind)
+	}
+	if prepared, ok := adapter.(provider.PreparedPutAdapter); ok {
+		return prepared.PutPrepared(ctx, account, input, provider.PreparedUpload{File: spool.file, Size: spool.size, ChecksumSHA256: spool.checksumSHA256})
+	}
+	return adapter.Put(ctx, account, input, spool.file)
 }
 
 func (s *Service) providerForObject(ctx context.Context, obj domain.ObjectRecord) (domain.ProviderAccount, provider.Adapter, error) {
@@ -680,6 +704,10 @@ func (s *Service) spoolUpload(body io.Reader) (*uploadSpool, func(), error) {
 		return nil, nil, err
 	}
 	return spool, cleanup, nil
+}
+
+func hasPersistentObjectAttributes(object domain.ObjectRecord) bool {
+	return len(object.Metadata) > 0 || len(object.Tags) > 0 || object.VersionID != "" || object.RetentionMode != "" || !object.RetainUntil.IsZero() || object.LegalHold
 }
 
 func replicaTargets(bucket domain.Bucket, primaryProviderID string) []string {

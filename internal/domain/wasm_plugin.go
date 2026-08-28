@@ -7,6 +7,11 @@ const WASMPluginABIV1 = "bucketmux.wasm.v1"
 const (
 	WASMPluginEventObjectCreated = "object.created"
 
+	WASMPluginOperationMetadataPatch = "metadata.patch"
+	WASMPluginOperationTagsPatch     = "tags.patch"
+	WASMPluginOperationObjectCopy    = "object.copy"
+	WASMPluginOperationObjectDelete  = "object.delete"
+
 	WASMPluginStatusPending    = "pending"
 	WASMPluginStatusRunning    = "running"
 	WASMPluginStatusSucceeded  = "succeeded"
@@ -18,26 +23,27 @@ const (
 // required to invoke it safely. ModuleBase64 is deliberately omitted from JSON
 // responses so listing plugins never downloads executable payloads.
 type WASMPlugin struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	Description      string            `json:"description,omitempty"`
-	ABIVersion       string            `json:"abi_version"`
-	ModuleBase64     string            `json:"-"`
-	ModuleSHA256     string            `json:"module_sha256"`
-	Events           []string          `json:"events"`
-	BucketPattern    string            `json:"bucket_pattern"`
-	KeyPrefix        string            `json:"key_prefix,omitempty"`
-	KeySuffix        string            `json:"key_suffix,omitempty"`
-	ContentTypes     []string          `json:"content_types,omitempty"`
-	Config           map[string]string `json:"config,omitempty"`
-	Enabled          bool              `json:"enabled"`
-	TimeoutMillis    int               `json:"timeout_millis"`
-	MemoryLimitBytes int64             `json:"memory_limit_bytes"`
-	MaxInputBytes    int64             `json:"max_input_bytes"`
-	MaxOutputBytes   int64             `json:"max_output_bytes"`
-	MaxAttempts      int               `json:"max_attempts"`
-	CreatedAt        time.Time         `json:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at"`
+	ID               string                    `json:"id"`
+	Name             string                    `json:"name"`
+	Description      string                    `json:"description,omitempty"`
+	ABIVersion       string                    `json:"abi_version"`
+	ModuleBase64     string                    `json:"-"`
+	ModuleSHA256     string                    `json:"module_sha256"`
+	Events           []string                  `json:"events"`
+	BucketPattern    string                    `json:"bucket_pattern"`
+	KeyPrefix        string                    `json:"key_prefix,omitempty"`
+	KeySuffix        string                    `json:"key_suffix,omitempty"`
+	ContentTypes     []string                  `json:"content_types,omitempty"`
+	Config           map[string]string         `json:"config,omitempty"`
+	OperationPolicy  WASMPluginOperationPolicy `json:"operation_policy,omitempty"`
+	Enabled          bool                      `json:"enabled"`
+	TimeoutMillis    int                       `json:"timeout_millis"`
+	MemoryLimitBytes int64                     `json:"memory_limit_bytes"`
+	MaxInputBytes    int64                     `json:"max_input_bytes"`
+	MaxOutputBytes   int64                     `json:"max_output_bytes"`
+	MaxAttempts      int                       `json:"max_attempts"`
+	CreatedAt        time.Time                 `json:"created_at"`
+	UpdatedAt        time.Time                 `json:"updated_at"`
 }
 
 type WASMPluginJob struct {
@@ -61,13 +67,14 @@ type WASMPluginJob struct {
 }
 
 type WASMPluginInvocation struct {
-	ABIVersion string                 `json:"abi_version"`
-	Event      string                 `json:"event"`
-	JobID      string                 `json:"job_id"`
-	Object     WASMPluginObject       `json:"object"`
-	Workspace  WASMPluginWorkspace    `json:"workspace"`
-	Config     map[string]string      `json:"config,omitempty"`
-	Context    map[string]interface{} `json:"context,omitempty"`
+	ABIVersion   string                 `json:"abi_version"`
+	Event        string                 `json:"event"`
+	JobID        string                 `json:"job_id"`
+	Object       WASMPluginObject       `json:"object"`
+	Workspace    WASMPluginWorkspace    `json:"workspace"`
+	Config       map[string]string      `json:"config,omitempty"`
+	Capabilities WASMPluginCapabilities `json:"capabilities,omitempty"`
+	Context      map[string]interface{} `json:"context,omitempty"`
 }
 
 type WASMPluginObject struct {
@@ -92,6 +99,37 @@ type WASMPluginResult struct {
 	Tags           map[string]string         `json:"tags,omitempty"`
 	Embeddings     []WASMPluginEmbedding     `json:"embeddings,omitempty"`
 	DerivedObjects []WASMPluginDerivedObject `json:"derived_objects,omitempty"`
+	Operations     []WASMPluginOperation     `json:"operations,omitempty"`
+}
+
+// WASMPluginOperationPolicy is the capability grant for declarative bucket
+// operations. An empty AllowedOperations list denies every operation, keeping
+// existing plugins backward compatible and least-privileged by default.
+type WASMPluginOperationPolicy struct {
+	AllowedOperations []string `json:"allowed_operations,omitempty"`
+	BucketPatterns    []string `json:"bucket_patterns,omitempty"`
+	KeyPrefixes       []string `json:"key_prefixes,omitempty"`
+	MaxOperations     int      `json:"max_operations,omitempty"`
+}
+
+type WASMPluginCapabilities struct {
+	Operations WASMPluginOperationPolicy `json:"operations,omitempty"`
+}
+
+// WASMPluginOperation is a language-neutral command manifest. BucketMux
+// validates the complete manifest before applying it; WASM modules never
+// receive provider credentials or direct network access.
+type WASMPluginOperation struct {
+	ID             string            `json:"id,omitempty"`
+	Type           string            `json:"type"`
+	Bucket         string            `json:"bucket,omitempty"`
+	Key            string            `json:"key,omitempty"`
+	SourceBucket   string            `json:"source_bucket,omitempty"`
+	SourceKey      string            `json:"source_key,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	Tags           map[string]string `json:"tags,omitempty"`
+	RemoveMetadata []string          `json:"remove_metadata,omitempty"`
+	RemoveTags     []string          `json:"remove_tags,omitempty"`
 }
 
 // WASMPluginEmbedding is the portable ABI representation returned by a

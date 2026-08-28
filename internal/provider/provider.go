@@ -3,9 +3,16 @@ package provider
 import (
 	"context"
 	"io"
+	"os"
 
 	"github.com/gnurub/bucketmux/internal/domain"
 )
+
+type PreparedUpload struct {
+	File           *os.File
+	Size           int64
+	ChecksumSHA256 string
+}
 
 type Adapter interface {
 	Put(ctx context.Context, account domain.ProviderAccount, input domain.PutObjectInput, body io.Reader) (domain.StoredObject, error)
@@ -13,6 +20,13 @@ type Adapter interface {
 	Head(ctx context.Context, account domain.ProviderAccount, obj domain.ObjectRecord) (domain.ObjectRecord, error)
 	Delete(ctx context.Context, account domain.ProviderAccount, obj domain.ObjectRecord) error
 	Health(ctx context.Context, account domain.ProviderAccount) domain.ProviderHealth
+}
+
+// PreparedPutAdapter is an optional zero-copy path for adapters that can take
+// ownership of BucketMux's durable upload spool. Other adapters continue to
+// receive the same io.Reader contract through Adapter.Put.
+type PreparedPutAdapter interface {
+	PutPrepared(ctx context.Context, account domain.ProviderAccount, input domain.PutObjectInput, upload PreparedUpload) (domain.StoredObject, error)
 }
 
 // ObjectLister and BucketDiscoverer are optional capabilities. Adapters that

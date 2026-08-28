@@ -13,6 +13,6 @@ function writeStdout(text: string): void {
 
 export function _start(): void {
   writeStdout(
-    '{"abi_version":"bucketmux.wasm.v1","metadata":{"classifier":"assemblyscript-bun-1.4-demo"},"tags":{"media-category":"image","safe-search":"not-evaluated"}}'
+    '{"abi_version":"bucketmux.wasm.v1","metadata":{"classifier":"assemblyscript-bun-1.4-demo"},"tags":{"media-category":"image","safe-search":"not-evaluated"},"operations":[{"id":"classification-tags","type":"tags.patch","tags":{"classification-state":"complete"},"remove_tags":["classification-pending"]}]}'
   );
 }

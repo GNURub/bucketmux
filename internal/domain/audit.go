@@ -7,6 +7,7 @@ const (
 	AuditActionProviderDeleted = "provider.deleted"
 	AuditActionHookDeleted     = "hook.deleted"
 	AuditActionMigrationMove   = "migration.move"
+	AuditActionWASMOperation   = "wasm.operation"
 )
 
 type AuditEvent struct {

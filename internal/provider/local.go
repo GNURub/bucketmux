@@ -84,6 +84,54 @@ func (a *LocalAdapter) Put(ctx context.Context, account domain.ProviderAccount, 
 	}, nil
 }
 
+func (a *LocalAdapter) PutPrepared(ctx context.Context, account domain.ProviderAccount, input domain.PutObjectInput, upload PreparedUpload) (domain.StoredObject, error) {
+	if upload.File == nil {
+		return domain.StoredObject{}, errors.New("prepared upload file is required")
+	}
+	remoteKey, err := safeRelativePath(input.StorageKey())
+	if err != nil {
+		return domain.StoredObject{}, err
+	}
+	path, err := a.objectPath(account, input.Bucket, remoteKey)
+	if err != nil {
+		return domain.StoredObject{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return domain.StoredObject{}, fmt.Errorf("create local object dir: %w", err)
+	}
+	if err := upload.File.Sync(); err != nil {
+		if errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT) {
+			return domain.StoredObject{}, &Error{Op: "sync prepared local object", Kind: FailureQuota, Err: err}
+		}
+		return domain.StoredObject{}, fmt.Errorf("sync prepared local object: %w", err)
+	}
+	if err := os.Rename(upload.File.Name(), path); err != nil {
+		if errors.Is(err, unix.EXDEV) {
+			if _, seekErr := upload.File.Seek(0, io.SeekStart); seekErr != nil {
+				return domain.StoredObject{}, fmt.Errorf("rewind cross-device local upload: %w", seekErr)
+			}
+			return a.Put(ctx, account, input, upload.File)
+		}
+		if errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT) {
+			return domain.StoredObject{}, &Error{Op: "commit prepared local object", Kind: FailureQuota, Err: err}
+		}
+		return domain.StoredObject{}, fmt.Errorf("commit prepared local object: %w", err)
+	}
+	contentType := input.ContentType
+	if contentType == "" {
+		contentType = mime.TypeByExtension(filepath.Ext(input.Key))
+	}
+	return domain.StoredObject{
+		ProviderAccountID: account.ID,
+		RemoteBucket:      account.Bucket,
+		RemoteKey:         remoteKey,
+		Size:              upload.Size,
+		ContentType:       contentType,
+		ETag:              `"` + upload.ChecksumSHA256 + `"`,
+		ChecksumSHA256:    upload.ChecksumSHA256,
+	}, nil
+}
+
 func (a *LocalAdapter) Quota(_ context.Context, account domain.ProviderAccount) (int64, int64, string, error) {
 	root, err := a.providerRoot(account)
 	if err != nil {

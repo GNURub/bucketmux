@@ -36,7 +36,7 @@ func TestGoBuiltWASMExamples(t *testing.T) {
 		t.Skip("set BUCKETMUX_RUN_WASM_EXAMPLES=1 after building examples")
 	}
 	runtime := NewRuntime(t.TempDir())
-	plugin := domain.WASMPlugin{ID: "go-example", Name: "Go example", ABIVersion: domain.WASMPluginABIV1, TimeoutMillis: 20_000, MemoryLimitBytes: 256 << 20, MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxAttempts: 3}
+	plugin := domain.WASMPlugin{ID: "go-example", Name: "Go example", ABIVersion: domain.WASMPluginABIV1, TimeoutMillis: 20_000, MemoryLimitBytes: 256 << 20, MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxAttempts: 3, OperationPolicy: domain.WASMPluginOperationPolicy{AllowedOperations: []string{domain.WASMPluginOperationMetadataPatch, domain.WASMPluginOperationObjectCopy}, BucketPatterns: []string{"archive"}, MaxOperations: 4}}
 	invocation := domain.WASMPluginInvocation{Event: domain.WASMPluginEventObjectCreated, JobID: "go-job", Object: domain.WASMPluginObject{Bucket: "images", Key: "hello.txt", Size: 11, ContentType: "text/plain"}}
 
 	metadataModule := readExampleModule(t, "go", "build", "metadata-tagger.wasm")
@@ -48,6 +48,18 @@ func TestGoBuiltWASMExamples(t *testing.T) {
 		t.Fatalf("Go metadata result = %+v", execution.Result)
 	}
 	_ = execution.Close()
+
+	invocation.Config = map[string]string{"copy_bucket": "archive", "copy_key": "processed/hello.txt"}
+	operatorModule := readExampleModule(t, "go", "build", "bucket-operator.wasm")
+	execution, err = runtime.Execute(context.Background(), operatorModule, plugin, invocation, strings.NewReader("hello wasm!"))
+	if err != nil {
+		t.Fatalf("Execute(Go bucket operator) error = %v", err)
+	}
+	if len(execution.Result.Operations) != 2 || execution.Result.Operations[1].Type != domain.WASMPluginOperationObjectCopy || execution.Result.Operations[1].Bucket != "archive" {
+		t.Fatalf("Go bucket operation result = %+v", execution.Result)
+	}
+	_ = execution.Close()
+	invocation.Config = nil
 
 	embeddingModule := readExampleModule(t, "go", "build", "embedding-generator.wasm")
 	execution, err = runtime.Execute(context.Background(), embeddingModule, plugin, invocation, strings.NewReader("hello wasm!"))
@@ -118,7 +130,7 @@ func TestRustAndBunBuiltWASMExamples(t *testing.T) {
 		t.Skip("set BUCKETMUX_RUN_WASM_EXAMPLES=1 after building examples")
 	}
 	runtime := NewRuntime(t.TempDir())
-	plugin := domain.WASMPlugin{ID: "example", Name: "Example", ABIVersion: domain.WASMPluginABIV1, TimeoutMillis: 10_000, MemoryLimitBytes: 128 << 20, MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxAttempts: 3}
+	plugin := domain.WASMPlugin{ID: "example", Name: "Example", ABIVersion: domain.WASMPluginABIV1, TimeoutMillis: 10_000, MemoryLimitBytes: 128 << 20, MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxAttempts: 3, OperationPolicy: domain.WASMPluginOperationPolicy{AllowedOperations: []string{domain.WASMPluginOperationMetadataPatch, domain.WASMPluginOperationTagsPatch}, MaxOperations: 4}}
 	invocation := domain.WASMPluginInvocation{Event: domain.WASMPluginEventObjectCreated, JobID: "job", Object: domain.WASMPluginObject{Bucket: "images", Key: "hello.txt", Size: 11, ContentType: "text/plain"}}
 
 	rustModule := readExampleModule(t, "rust", "target", "wasm32-wasip1", "release", "uppercase-transform.wasm")
@@ -140,6 +152,16 @@ func TestRustAndBunBuiltWASMExamples(t *testing.T) {
 		t.Fatalf("Rust result = %+v", execution.Result)
 	}
 
+	rustClassifier := readExampleModule(t, "rust", "target", "wasm32-wasip1", "release", "image-classifier.wasm")
+	execution, err = runtime.Execute(context.Background(), rustClassifier, plugin, invocation, strings.NewReader("hello wasm!"))
+	if err != nil {
+		t.Fatalf("Execute(Rust classifier) error = %v", err)
+	}
+	if len(execution.Result.Operations) != 1 || execution.Result.Operations[0].Type != domain.WASMPluginOperationMetadataPatch {
+		t.Fatalf("Rust classifier operations = %+v", execution.Result.Operations)
+	}
+	_ = execution.Close()
+
 	bunModule := readExampleModule(t, "bun-assemblyscript", "build", "image-classifier.wasm")
 	invocation.Object.Size = 3
 	execution, err = runtime.Execute(context.Background(), bunModule, plugin, invocation, strings.NewReader("img"))
@@ -150,6 +172,9 @@ func TestRustAndBunBuiltWASMExamples(t *testing.T) {
 	encoded, _ := json.Marshal(execution.Result)
 	if execution.Result.Tags["media-category"] != "image" {
 		t.Fatalf("Bun/AssemblyScript result = %s", encoded)
+	}
+	if len(execution.Result.Operations) != 1 || execution.Result.Operations[0].Type != domain.WASMPluginOperationTagsPatch {
+		t.Fatalf("Bun/AssemblyScript operations = %+v", execution.Result.Operations)
 	}
 
 	timeoutModule := readExampleModule(t, "bun-assemblyscript", "build", "timeout-fixture.wasm")

@@ -386,6 +386,7 @@ CREATE TABLE IF NOT EXISTS wasm_plugins (
   key_suffix TEXT NOT NULL DEFAULT '',
   content_types_json TEXT NOT NULL DEFAULT '[]',
   config_json TEXT NOT NULL DEFAULT '{}',
+  operation_policy_json TEXT NOT NULL DEFAULT '{}',
   enabled INTEGER NOT NULL DEFAULT 0,
   timeout_millis INTEGER NOT NULL DEFAULT 5000,
   memory_limit_bytes INTEGER NOT NULL DEFAULT 67108864,
@@ -624,6 +625,9 @@ CREATE TABLE IF NOT EXISTS maintenance_leases (
 		}
 	}
 	if err := s.addColumnIfMissing(ctx, executor, "wasm_plugin_jobs", "source_updated_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing(ctx, executor, "wasm_plugins", "operation_policy_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
 	return nil

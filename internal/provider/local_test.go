@@ -11,6 +11,37 @@ import (
 	"github.com/gnurub/bucketmux/internal/domain"
 )
 
+func TestLocalAdapterCommitsPreparedUploadWithoutCopying(t *testing.T) {
+	baseDir := t.TempDir()
+	adapter := NewLocalAdapter(baseDir)
+	account := domain.ProviderAccount{ID: "local-a", Bucket: "images"}
+	spool, err := os.CreateTemp(baseDir, "spool-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+	})
+	if _, err := spool.WriteString("prepared-content"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := adapter.PutPrepared(context.Background(), account, domain.PutObjectInput{Bucket: "images", Key: "prepared.txt", ContentType: "text/plain"}, PreparedUpload{File: spool, Size: 16, ChecksumSHA256: "known-checksum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Size != 16 || stored.ChecksumSHA256 != "known-checksum" || stored.ETag != `"known-checksum"` {
+		t.Fatalf("stored = %+v", stored)
+	}
+	if _, err := os.Stat(spool.Name()); !os.IsNotExist(err) {
+		t.Fatalf("spool path still exists after atomic rename: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(baseDir, "objects", account.ID, "images", "prepared.txt"))
+	if err != nil || string(content) != "prepared-content" {
+		t.Fatalf("prepared content=%q err=%v", content, err)
+	}
+}
+
 func TestLocalAdapterUsesConfiguredProviderPath(t *testing.T) {
 	baseDir := t.TempDir()
 	customDir := filepath.Join(baseDir, "disk-a")

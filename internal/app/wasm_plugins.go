@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gnurub/bucketmux/internal/domain"
+	"github.com/gnurub/bucketmux/internal/store"
 	"github.com/gnurub/bucketmux/internal/wasmplugin"
 )
 
@@ -24,6 +25,7 @@ const (
 	wasmPluginWorkStaleAfter = 2 * time.Minute
 	wasmPluginMaxTimeout     = 10 * time.Minute
 	wasmPluginMaxMemoryBytes = int64(1 << 30)
+	wasmPluginMaxOperations  = 32
 )
 
 var errWASMSourceSuperseded = errors.New("source object was replaced during plugin execution")
@@ -133,6 +135,34 @@ func (s *Service) normalizeWASMPlugin(plugin *domain.WASMPlugin) error {
 	}
 	plugin.Events = uniqueStrings(plugin.Events)
 	plugin.ContentTypes = uniqueStrings(plugin.ContentTypes)
+	plugin.OperationPolicy.AllowedOperations = uniqueStrings(plugin.OperationPolicy.AllowedOperations)
+	for _, operationType := range plugin.OperationPolicy.AllowedOperations {
+		switch operationType {
+		case domain.WASMPluginOperationMetadataPatch, domain.WASMPluginOperationTagsPatch, domain.WASMPluginOperationObjectCopy, domain.WASMPluginOperationObjectDelete:
+		default:
+			return fmt.Errorf("unsupported plugin operation %q", operationType)
+		}
+	}
+	plugin.OperationPolicy.BucketPatterns = uniqueStrings(plugin.OperationPolicy.BucketPatterns)
+	for _, pattern := range plugin.OperationPolicy.BucketPatterns {
+		if _, err := path.Match(pattern, "bucket"); err != nil {
+			return fmt.Errorf("invalid operation bucket pattern %q: %w", pattern, err)
+		}
+	}
+	plugin.OperationPolicy.KeyPrefixes = uniqueStrings(plugin.OperationPolicy.KeyPrefixes)
+	for i, prefix := range plugin.OperationPolicy.KeyPrefixes {
+		prefix = strings.TrimLeft(strings.TrimSpace(prefix), "/")
+		if prefix == "" || prefix == "." || prefix == ".." || strings.HasPrefix(path.Clean(prefix), "../") {
+			return fmt.Errorf("invalid operation key prefix %q", prefix)
+		}
+		plugin.OperationPolicy.KeyPrefixes[i] = prefix
+	}
+	if plugin.OperationPolicy.MaxOperations <= 0 {
+		plugin.OperationPolicy.MaxOperations = 16
+	}
+	if plugin.OperationPolicy.MaxOperations > wasmPluginMaxOperations {
+		return fmt.Errorf("plugin operation maximum cannot exceed %d", wasmPluginMaxOperations)
+	}
 	return nil
 }
 
@@ -269,7 +299,8 @@ func (s *Service) runWASMPluginJob(ctx context.Context, job domain.WASMPluginJob
 			Bucket: object.Bucket, Key: object.Key, Size: object.Size, ContentType: object.ContentType,
 			ETag: object.ETag, ChecksumSHA256: object.ChecksumSHA256, Metadata: object.Metadata, Tags: object.Tags,
 		},
-		Config: plugin.Config,
+		Config:       plugin.Config,
+		Capabilities: domain.WASMPluginCapabilities{Operations: plugin.OperationPolicy},
 	}
 	execution, executeErr := s.WASMRuntime.Execute(ctx, module, plugin, invocation, body)
 	closeErr := body.Close()
@@ -307,6 +338,9 @@ func (s *Service) runWASMPluginJob(ctx context.Context, job domain.WASMPluginJob
 }
 
 func (s *Service) applyWASMPluginResult(ctx context.Context, plugin domain.WASMPlugin, source domain.ObjectRecord, execution *wasmplugin.Execution) error {
+	if err := wasmplugin.ValidateOperations(plugin, domain.WASMPluginObject{Bucket: source.Bucket, Key: source.Key}, execution.Result.Operations); err != nil {
+		return fmt.Errorf("validate plugin operations: %w", err)
+	}
 	current, err := s.Store.GetObject(ctx, source.Bucket, source.Key)
 	if err != nil {
 		return fmt.Errorf("reload source object: %w", err)
@@ -361,7 +395,82 @@ func (s *Service) applyWASMPluginResult(ctx context.Context, plugin domain.WASMP
 			return closeErr
 		}
 	}
+	for _, operation := range execution.Result.Operations {
+		if err := s.applyWASMPluginOperation(ctx, operation); err != nil {
+			return fmt.Errorf("apply operation %q (%s): %w", operation.ID, operation.Type, err)
+		}
+		s.RecordAuditEvent(ctx, domain.AuditEvent{
+			Actor: "wasm:" + plugin.ID, Action: domain.AuditActionWASMOperation,
+			Bucket: operation.Bucket, Key: operation.Key, TargetID: operation.ID, Detail: operation.Type,
+		})
+	}
 	return nil
+}
+
+func (s *Service) applyWASMPluginOperation(ctx context.Context, operation domain.WASMPluginOperation) error {
+	switch operation.Type {
+	case domain.WASMPluginOperationMetadataPatch, domain.WASMPluginOperationTagsPatch:
+		object, err := s.Store.GetObject(ctx, operation.Bucket, operation.Key)
+		if err != nil {
+			return err
+		}
+		if err := s.Store.HydrateObjectAttributes(ctx, &object); err != nil {
+			return err
+		}
+		if operation.Type == domain.WASMPluginOperationMetadataPatch {
+			object.Metadata = patchStringMap(object.Metadata, operation.Metadata, operation.RemoveMetadata)
+		} else {
+			object.Tags = patchStringMap(object.Tags, operation.Tags, operation.RemoveTags)
+		}
+		return s.Store.PutObjectAttributes(ctx, object)
+	case domain.WASMPluginOperationObjectCopy:
+		targetBucket, err := s.Store.GetBucket(ctx, operation.Bucket)
+		if err != nil {
+			return fmt.Errorf("load target bucket: %w", err)
+		}
+		if !targetBucket.VersioningEnabled {
+			existing, existingErr := s.Store.GetObject(ctx, operation.Bucket, operation.Key)
+			if existingErr == nil {
+				_ = s.Store.HydrateObjectAttributes(ctx, &existing)
+				if err := validateObjectDeletion(existing, DeleteObjectOptions{}); err != nil {
+					return fmt.Errorf("copy target is protected: %w", err)
+				}
+			} else if !errors.Is(existingErr, store.ErrNotFound) {
+				return existingErr
+			}
+		}
+		body, source, err := s.GetObject(ctx, operation.SourceBucket, operation.SourceKey)
+		if err != nil {
+			return fmt.Errorf("read copy source: %w", err)
+		}
+		metadata := patchStringMap(source.Metadata, operation.Metadata, operation.RemoveMetadata)
+		tags := patchStringMap(source.Tags, operation.Tags, operation.RemoveTags)
+		_, putErr := s.PutObject(ctx, domain.PutObjectInput{
+			Bucket: operation.Bucket, Key: operation.Key, Size: source.Size, ContentType: source.ContentType,
+			Metadata: metadata, Tags: tags, ChecksumSHA256: source.ChecksumSHA256, SkipWASMPipelines: true,
+		}, body)
+		closeErr := body.Close()
+		if putErr != nil {
+			return putErr
+		}
+		return closeErr
+	case domain.WASMPluginOperationObjectDelete:
+		_, err := s.DeleteObjectWithOptions(ctx, operation.Bucket, operation.Key, DeleteObjectOptions{})
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		return err
+	default:
+		return fmt.Errorf("unsupported operation type %q", operation.Type)
+	}
+}
+
+func patchStringMap(base, additions map[string]string, removals []string) map[string]string {
+	patched := mergeStringMaps(base, additions)
+	for _, key := range removals {
+		delete(patched, key)
+	}
+	return patched
 }
 
 func (s *Service) ListObjectEmbeddings(ctx context.Context, bucket, key string) ([]domain.ObjectEmbedding, error) {

@@ -97,7 +97,7 @@ Reads are transparent because BucketMux knows where every object landed.
 
 ### Sandboxed WASM processing
 
-Object-created events can enqueue durable `bucketmux.wasm.v1` pipelines for transforms, derived files, metadata extraction, classification, and typed embeddings (including one vector per detected face). Guests written in Go 1.27, TinyGo, Rust, or Bun 1.4/AssemblyScript run asynchronously with WASI filesystem isolation, import allowlisting, memory/time/stdio/output limits, atomic multi-instance claims, heartbeats, retries, generation deduplication, alerts, and normal BucketMux placement for every derived object. Embeddings are atomically persisted with model provenance and overwrite invalidation. Turso performs native exact vector search for single-instance deployments; production Postgres deployments can require pgvector 0.8+ and receive transactionally synchronized native vectors, migration backfill, partial HNSW indexes per model profile, iterative scans, and cross-instance index coordination. See [the ABI and security guide](docs/wasm-plugins.md) and examples under `examples/wasm`.
+Object-created events can enqueue durable `bucketmux.wasm.v1` pipelines for transforms, derived files, metadata extraction, classification, typed embeddings (including one vector per detected face), and Lambda-like declarative bucket operations. Guests can request scoped metadata/tag patches, copies, and protected deletes through explicit deny-by-default capability policies; they never receive provider credentials or direct network access. Go 1.27, TinyGo, Rust, and Bun 1.4/AssemblyScript guests run asynchronously with WASI filesystem isolation, import allowlisting, memory/time/stdio/output limits, atomic multi-instance claims, heartbeats, retries, generation deduplication, alerts, audit events, and normal BucketMux placement for every derived or copied object. Embeddings are atomically persisted with model provenance and overwrite invalidation. Turso performs native exact vector search for single-instance deployments; production Postgres deployments can require pgvector 0.8+ and receive transactionally synchronized native vectors, migration backfill, partial HNSW indexes per model profile, iterative scans, and cross-instance index coordination. See [the ABI and security guide](docs/wasm-plugins.md) and examples under `examples/wasm`.
 
 Configured capacity is a hard BucketMux limit. Remote usage is reconciled from
 provider inventory; adapters with a native quota signal can additionally report
@@ -324,8 +324,8 @@ store:
   kind: "sqlite"
   sqlite:
     path: "/data/switcher.db"
-    max_open_conns: 10
-    max_idle_conns: 10
+    max_open_conns: 4
+    max_idle_conns: 4
 
 s3:
   access_key: "local-access-key"
@@ -388,8 +388,8 @@ Common environment variables:
 | `ADMIN_OIDC_SESSION_HOURS` | Encrypted admin session duration. Defaults to 8 hours. |
 | `STORE_KIND` | `sqlite` or `postgres`. The `sqlite` backend is executed by Turso Database. |
 | `SQLITE_PATH` | Embedded SQLite-compatible database path. Existing SQLite files are supported. |
-| `SQLITE_MAX_OPEN_CONNS` | Maximum open connections for the embedded backend. Defaults to `10`. |
-| `SQLITE_MAX_IDLE_CONNS` | Maximum idle connections for the embedded backend. Defaults to `10`. |
+| `SQLITE_MAX_OPEN_CONNS` | Maximum open connections for the embedded backend. Defaults to `4`; higher values can reduce mixed-workload throughput because Turso serializes conflicting writes. |
+| `SQLITE_MAX_IDLE_CONNS` | Maximum idle connections for the embedded backend. Defaults to `4`. |
 | `POSTGRES_DSN` | Postgres connection string. |
 | `POSTGRES_MAX_OPEN_CONNS` | Max open Postgres connections. |
 | `POSTGRES_MAX_IDLE_CONNS` | Max idle Postgres connections. |
@@ -723,6 +723,10 @@ installed `k6` binary when available and otherwise runs the pinned
 they are not a substitute for capacity testing with production hardware and
 remote providers.
 
+See [Performance and tuning](docs/performance.md) for the Turso pool rationale,
+the prepared local-upload path, database-write reductions, deployment caveats,
+and workload-specific tuning guidance.
+
 ---
 
 ## Multipart uploads
@@ -890,9 +894,14 @@ store:
   kind: "sqlite"
   sqlite:
     path: "/data/switcher.db"
-    max_open_conns: 10
-    max_idle_conns: 10
+    max_open_conns: 4
+    max_idle_conns: 4
 ```
+
+The `4/4` pool is a conservative default for mixed reads and serialized writes,
+not a hard ceiling. Keep the upload spool and a local provider on the same
+filesystem to let BucketMux commit local uploads with a synchronized atomic
+rename instead of a second copy. See [Performance and tuning](docs/performance.md).
 
 Use Postgres when you need stronger concurrency or plan to scale multiple BucketMux instances:
 

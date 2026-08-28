@@ -173,7 +173,7 @@ func Default() Config {
 			MaxAdminBodyBytes:     1 << 20,
 		},
 		Store: StoreConfig{
-			Kind: "sqlite", SQLite: SQLiteStoreConfig{Path: "/data/switcher.db", MaxOpenConns: 10, MaxIdleConns: 10}, Postgres: PostgresStoreConfig{MaxOpenConns: 25, MaxIdleConns: 10},
+			Kind: "sqlite", SQLite: SQLiteStoreConfig{Path: "/data/switcher.db", MaxOpenConns: 4, MaxIdleConns: 4}, Postgres: PostgresStoreConfig{MaxOpenConns: 25, MaxIdleConns: 10},
 			VectorSearch: VectorSearchConfig{Backend: "auto", HNSWM: 16, EFConstruction: 64, EFSearch: 100, MaxScanTuples: 20_000, MaxProfiles: 64},
 		},
 		Coordination: CoordinationConfig{Kind: "database", Redis: RedisConfig{Addr: "127.0.0.1:6379", KeyPrefix: "bucketmux", LeaseTTLSeconds: 5}},
@@ -358,10 +358,10 @@ func (c *Config) Normalize() {
 		c.Store.VectorSearch.MaxProfiles = 64
 	}
 	if c.Store.SQLite.MaxOpenConns == 0 {
-		c.Store.SQLite.MaxOpenConns = 10
+		c.Store.SQLite.MaxOpenConns = 4
 	}
 	if c.Store.SQLite.MaxIdleConns == 0 {
-		c.Store.SQLite.MaxIdleConns = 10
+		c.Store.SQLite.MaxIdleConns = 4
 	}
 	if c.Store.SQLite.Path == "" {
 		c.Store.SQLite.Path = c.Server.DBPath

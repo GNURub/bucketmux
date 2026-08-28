@@ -13,6 +13,7 @@ Build all examples with the reusable `sdk/go/bucketmuxplugin` package:
 - `metadata-tagger` streams the object through SHA-256 and emits metadata/tags.
 - `image-dimensions` decodes real PNG/JPEG/GIF headers.
 - `embedding-generator` emits a normalized 16-dimensional fixture vector, allowing the complete Turso persistence and native similarity-search path to be tested. It is deliberately not a biometric model.
+- `bucket-operator` checks the operation capabilities supplied in the invocation, patches source metadata, and optionally requests a cross-bucket copy.
 
 The same SDK is compatible with a `wasip1` TinyGo command. Native Go `plugin.so` files are intentionally unsupported because they are platform-specific and run with full host privileges.
 
@@ -26,7 +27,7 @@ rustup target add wasm32-wasip1
 ```
 
 - `uppercase-transform` creates a derived object and changes source metadata/tags.
-- `image-classifier` demonstrates rule/model classification metadata.
+- `image-classifier` demonstrates rule/model classification metadata and a declarative `metadata.patch` command.
 - `embedding-matcher` compares **precomputed** embeddings with cosine similarity. It demonstrates the matching seam; it does not detect faces itself.
 
 ## Bun 1.4 + AssemblyScript guest
@@ -40,6 +41,7 @@ bun test
 ```
 
 The production server does not depend on Bun's partially implemented `node:wasi`. Its guest is executed by BucketMux through the same WASI sandbox as Rust modules.
+The AssemblyScript classifier also returns a `tags.patch` command and its Bun conformance test checks that ABI shape.
 
 ## ABI result
 
@@ -64,6 +66,20 @@ The production server does not depend on Bun's partially implemented `node:wasi`
       "key_suffix": ".thumbnail.webp",
       "content_type": "image/webp"
     }
+  ],
+  "operations": [
+    {
+      "id": "mark-complete",
+      "type": "metadata.patch",
+      "metadata": {"pipeline-state": "complete"},
+      "remove_metadata": ["pipeline-pending"]
+    },
+    {
+      "id": "archive",
+      "type": "object.copy",
+      "bucket": "archive",
+      "key": "processed/photo.jpg"
+    }
   ]
 }
 ```
@@ -71,3 +87,5 @@ The production server does not depend on Bun's partially implemented `node:wasi`
 `path` must be relative to `/output`. A derived object cannot overwrite its source and does not recursively invoke pipelines.
 
 Embedding values are stored separately as compact vectors and are redacted from job history and admin responses. `dimensions` must exactly match the complete array.
+
+Operations require an explicit `operation_policy` when the plugin is installed. The supported types are `metadata.patch`, `tags.patch`, `object.copy`, and `object.delete`; access is denied by default and can be restricted with bucket patterns, key prefixes, and `max_operations`. The guest never receives storage credentials or direct network access.
