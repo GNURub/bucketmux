@@ -2,7 +2,8 @@
 set -eu
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-work_dir="$(mktemp -d "${TMPDIR:-/tmp}/bucketmux-k6.XXXXXX")"
+work_root="${K6_WORK_ROOT:-${TMPDIR:-/tmp}}"
+work_dir="$(mktemp -d "$work_root/bucketmux-k6.XXXXXX")"
 binary="$work_dir/bucketmux"
 server_log="$work_dir/server.log"
 target_port="${K6_TARGET_PORT:-18089}"

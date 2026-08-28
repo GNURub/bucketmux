@@ -17,6 +17,8 @@ store:
 
 `store.kind: sqlite` uses the embedded Turso Database engine. Existing SQLite-compatible files continue to open in place; `turso` is deliberately not exposed as a configuration kind.
 
+BucketMux initializes Turso in WAL mode and applies `synchronous=NORMAL`, foreign-key enforcement, and the busy timeout to every pooled connection. This retains crash-safe WAL semantics while avoiding full-sync serialization on every metadata commit.
+
 The default connection pool is four open and four idle connections. Turso can serve concurrent reads, but conflicting writes are serialized by the database. A larger pool can therefore add scheduling and lock contention without improving a mixed S3 workload. Four is a conservative default, not a hard limit: measure with the production workload before changing it.
 
 Use Postgres rather than opening one embedded database file from multiple BucketMux processes. Postgres is the supported backend for multi-instance deployments and higher metadata-write concurrency.
@@ -76,6 +78,8 @@ K6_VUS=50 K6_DURATION=2m make test-k6
 ```
 
 The checked-in thresholds are regression guards for a local gateway, not production capacity claims. Test again with the intended disks, object sizes, network providers, replication policy, plugins, and encryption settings.
+
+GitHub Actions places only the k6 working directory on `/dev/shm`. This removes hosted-runner disk and `fsync` variance from the strict gateway regression gate; the local-provider test suite still exercises synchronized disk commits. Running `make test-k6` normally continues to use `${TMPDIR:-/tmp}` unless `K6_WORK_ROOT` is explicitly set.
 
 The correctness paths behind these optimizations are covered by:
 

@@ -246,7 +246,10 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Run the mixed S3 performance workload
-        run: K6_VUS=10 K6_DURATION=20s make test-k6
+        # Hosted-runner disk fsync latency is highly variable. Keep the strict
+        # gateway regression thresholds on tmpfs; disk durability remains
+        # covered by the normal local-provider tests.
+        run: K6_WORK_ROOT=/dev/shm K6_VUS=10 K6_DURATION=20s make test-k6
 
   docker:
     name: Build and publish Docker image
