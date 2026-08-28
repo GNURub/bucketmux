@@ -1653,7 +1653,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BucketMux admin</title>
-  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js" integrity="sha384-Q+Dky3iHVJOr6wUjQ4ulh6uQ76an/t+ak1+PjMVaxRjbZamFLAG+u9InkfjbsEQf" crossorigin="anonymous" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js" integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V" crossorigin="anonymous" defer></script>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23171717'/%3E%3Cpath d='M10 8h7.5c4 0 6 1.6 6 4.3 0 1.8-.9 3.1-2.7 3.7 2.1.6 3.2 1.9 3.2 3.9 0 2.8-2.2 4.6-6.2 4.6H10V8Zm6.9 6.5c1.7 0 2.5-.6 2.5-1.8 0-1.1-.8-1.7-2.5-1.7h-2.8v3.5h2.8Zm.4 6.9c1.8 0 2.7-.7 2.7-2s-.9-1.9-2.7-1.9h-3.2v3.9h3.2Z' fill='white'/%3E%3C/svg%3E" />
   <style>
     :root{
@@ -1781,7 +1781,7 @@ var indexTemplate = template.Must(template.New("admin").Funcs(template.FuncMap{
     @media (max-width:760px){.app-shell{display:block}.workspace{grid-column:auto}.sidebar{transform:translateX(-100%);transition:transform .18s ease;box-shadow:var(--shadow)}.sidebar.open{transform:translateX(0)}.topbar{height:58px;padding:0 16px}.icon-btn.mobile-menu{display:grid}.dashboard-search{width:min(100%,320px)}.search-shortcut,.topbar-status{display:none}.shell{padding:24px 16px 48px}.page-heading{display:grid}.hero-actions{justify-content:flex-start}.stats{grid-template-columns:1fr}.stat{border-right:0;border-bottom:1px solid var(--line)}.stat:last-child{border-bottom:0}.grid>aside .stack,.grid>aside.stack{grid-template-columns:1fr}.form-grid,.browser-toolbar,.provider-catalog{grid-template-columns:1fr}.card-header{align-items:flex-start}.table-wrap{overflow-x:auto}.hero h2{font-size:25px}}
   </style>
 </head>
-<body hx-boost="true" hx-target="body" hx-swap="innerHTML show:top">
+<body>
   <div class="app-shell">
     <aside id="admin-sidebar" class="sidebar" aria-label="Admin navigation">
       <div class="sidebar-brand"><div class="brand"><div class="logo">B</div><div><h1>BucketMux</h1><p>Storage gateway</p></div></div></div>

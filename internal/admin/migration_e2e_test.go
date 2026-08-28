@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,18 @@ func TestMigrationAPIAndUIAcrossS3LikeAndLocalProviders(t *testing.T) {
 
 	dataDir := t.TempDir()
 	localDir := filepath.Join(dataDir, "local-provider")
+	preexistingAPIObjects := map[string][]byte{
+		"preexisting/api/root.jpg":                   {0xff, 0xd8, 0xff, 0xe0, 'a', 'p', 'i'},
+		"preexisting/api/albums/summer.png":          {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 'a', 'p', 'i'},
+		"preexisting/api/albums/2026/raw/photo.webp": {'R', 'I', 'F', 'F', 0x03, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P', 'a', 'p', 'i'},
+	}
+	preexistingUIObjects := map[string][]byte{
+		"preexisting/ui/cover.jpg":                 {0xff, 0xd8, 0xff, 0xe0, 'u', 'i'},
+		"preexisting/ui/events/keynote.png":        {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 'u', 'i'},
+		"preexisting/ui/events/day-2/gallery.webp": {'R', 'I', 'F', 'F', 0x02, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P', 'u', 'i'},
+	}
+	writePreexistingLocalObjects(t, localDir, preexistingAPIObjects)
+	writePreexistingLocalObjects(t, localDir, preexistingUIObjects)
 	accounts := migrationProviderAccounts(localDir)
 	svc, err := app.NewService(context.Background(), config.Config{
 		Server: config.ServerConfig{
@@ -110,10 +123,32 @@ func TestMigrationAPIAndUIAcrossS3LikeAndLocalProviders(t *testing.T) {
 	runMigrationsThroughAdminUI(t, playwrightCLI, server.URL, uiCases)
 	for _, testCase := range uiCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			requireCompletedMigrationForPrefix(t, svc, testCase.key)
+			requireCompletedMigrationForPrefix(t, svc, testCase.key, 1)
 			requireMigrationMovedObject(t, svc, accounts, localDir, originals[testCase.key], testCase)
 		})
 	}
+
+	t.Run("pre-existing nested images through API inventory and move", func(t *testing.T) {
+		inventory := createInventoryThroughAPI(t, server.URL, "preexisting/api/")
+		waitForInventoryThroughAPI(t, server.URL, inventory.ID, len(preexistingAPIObjects))
+		requireImportedLocalObjects(t, svc, localDir, preexistingAPIObjects)
+
+		migrationCase := migrationE2ECase{source: "local-disk", target: "s3-target", key: "preexisting/api/", mode: domain.MigrationModeMove}
+		job := createMigrationThroughAPI(t, server.URL, migrationCase)
+		waitForMigrationThroughAPI(t, server.URL, job.ID, len(preexistingAPIObjects))
+		requirePreexistingMoveToS3(t, svc, accounts, localDir, preexistingAPIObjects)
+	})
+
+	t.Run("pre-existing nested images through UI inventory and copy", func(t *testing.T) {
+		runInventoryThroughAdminUI(t, playwrightCLI, server.URL, "preexisting/ui/", preexistingUIObjects)
+		requireImportedLocalObjects(t, svc, localDir, preexistingUIObjects)
+
+		migrationCase := migrationE2ECase{name: "UI copy of pre-existing nested images", trigger: "ui", source: "local-disk", target: "s3-target", key: "preexisting/ui/", mode: domain.MigrationModeCopy}
+		runMigrationsThroughAdminUI(t, playwrightCLI, server.URL, []migrationE2ECase{migrationCase})
+		requireCompletedMigrationForPrefix(t, svc, migrationCase.key, len(preexistingUIObjects))
+		requirePreexistingCopyToS3(t, svc, accounts, localDir, preexistingUIObjects)
+	})
+
 	runAdvancedAdminControlsUI(t, playwrightCLI, server.URL, uiCases[2].key, uiCases[2].content)
 	bucket, err := svc.Store.GetBucket(t.Context(), "images")
 	if err != nil || !bucket.VersioningEnabled || !bucket.TrashEnabled || bucket.TrashRetentionDays != 30 {
@@ -132,6 +167,7 @@ type migrationE2ECase struct {
 	target  string
 	key     string
 	content string
+	mode    string
 }
 
 func migrationProviderAccounts(localDir string) map[string]domain.ProviderAccount {
@@ -213,11 +249,105 @@ func putMigrationObjectThroughGateway(t *testing.T, svc *app.Service, baseURL st
 	return obj
 }
 
-func createMigrationThroughAPI(t *testing.T, baseURL string, testCase migrationE2ECase) domain.MigrationJob {
+func writePreexistingLocalObjects(t *testing.T, localDir string, objects map[string][]byte) {
+	t.Helper()
+	for key, content := range objects {
+		path := filepath.Join(localDir, "images", filepath.FromSlash(key))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+}
+
+func createInventoryThroughAPI(t *testing.T, baseURL, prefix string) domain.InventoryJob {
 	t.Helper()
 	payload, err := json.Marshal(map[string]string{
+		"provider_account_id": "local-disk",
+		"bucket":              "images",
+		"remote_bucket":       "images",
+		"prefix":              prefix,
+		"mode":                domain.InventoryModeImport,
+	})
+	if err != nil {
+		t.Fatalf("Marshal(inventory) error = %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/admin/api/inventory-jobs", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("NewRequest(inventory) error = %v", err)
+	}
+	req.SetBasicAuth(migrationAdminUser, migrationAdminPassword)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("POST inventory error = %v", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("POST inventory status=%d body=%s", res.StatusCode, body)
+	}
+	var job domain.InventoryJob
+	if err := json.NewDecoder(res.Body).Decode(&job); err != nil {
+		t.Fatalf("Decode(inventory) error = %v", err)
+	}
+	return job
+}
+
+func waitForInventoryThroughAPI(t *testing.T, baseURL, jobID string, expectedObjects int) domain.InventoryJob {
+	t.Helper()
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		req, err := http.NewRequest(http.MethodGet, baseURL+"/admin/api/inventory-jobs", nil)
+		if err != nil {
+			t.Fatalf("NewRequest(list inventory) error = %v", err)
+		}
+		req.SetBasicAuth(migrationAdminUser, migrationAdminPassword)
+		res, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatalf("GET inventory error = %v", err)
+		}
+		var jobs []domain.InventoryJob
+		decodeErr := json.NewDecoder(res.Body).Decode(&jobs)
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusOK || decodeErr != nil {
+			t.Fatalf("GET inventory status=%d decode=%v", res.StatusCode, decodeErr)
+		}
+		for _, job := range jobs {
+			if job.ID != jobID {
+				continue
+			}
+			if job.Status == domain.InventoryStatusFailed {
+				t.Fatalf("inventory %s failed: %s", job.ID, job.LastError)
+			}
+			if job.Status == domain.InventoryStatusCompleted {
+				if job.DiscoveredObjects != expectedObjects || job.ImportedObjects != expectedObjects || job.MissingObjects != 0 {
+					t.Fatalf("inventory counters = %+v", job)
+				}
+				return job
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("inventory %s did not complete before timeout", jobID)
+	return domain.InventoryJob{}
+}
+
+func createMigrationThroughAPI(t *testing.T, baseURL string, testCase migrationE2ECase) domain.MigrationJob {
+	t.Helper()
+	mode := testCase.mode
+	if mode == "" {
+		mode = domain.MigrationModeMove
+	}
+	confirmation := ""
+	if mode == domain.MigrationModeMove {
+		confirmation = app.MigrationMoveConfirmationPhrase
+	}
+	payload, err := json.Marshal(map[string]string{
 		"bucket": "images", "prefix": testCase.key, "source_provider_id": testCase.source, "target_provider_id": testCase.target,
-		"mode": domain.MigrationModeMove, "confirm": app.MigrationMoveConfirmationPhrase,
+		"mode": mode, "confirm": confirmation,
 	})
 	if err != nil {
 		t.Fatalf("Marshal(migration) error = %v", err)
@@ -244,8 +374,12 @@ func createMigrationThroughAPI(t *testing.T, baseURL string, testCase migrationE
 	return job
 }
 
-func waitForMigrationThroughAPI(t *testing.T, baseURL, jobID string) domain.MigrationJob {
+func waitForMigrationThroughAPI(t *testing.T, baseURL, jobID string, expectedObjects ...int) domain.MigrationJob {
 	t.Helper()
+	wantObjects := 1
+	if len(expectedObjects) > 0 {
+		wantObjects = expectedObjects[0]
+	}
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		req, err := http.NewRequest(http.MethodGet, baseURL+"/admin/api/migrations?limit=20", nil)
@@ -271,7 +405,7 @@ func waitForMigrationThroughAPI(t *testing.T, baseURL, jobID string) domain.Migr
 				t.Fatalf("migration %s failed: %s", job.ID, job.LastError)
 			}
 			if job.Status == domain.MigrationStatusCompleted {
-				if job.TotalObjects != 1 || job.ProcessedObjects != 1 || job.SucceededObjects != 1 || job.FailedObjects != 0 {
+				if job.TotalObjects != wantObjects || job.ProcessedObjects != wantObjects || job.SucceededObjects != wantObjects || job.FailedObjects != 0 {
 					t.Fatalf("migration counters = %+v", job)
 				}
 				return job
@@ -281,6 +415,70 @@ func waitForMigrationThroughAPI(t *testing.T, baseURL, jobID string) domain.Migr
 	}
 	t.Fatalf("migration %s did not complete before timeout", jobID)
 	return domain.MigrationJob{}
+}
+
+func runInventoryThroughAdminUI(t *testing.T, cli, baseURL, prefix string, objects map[string][]byte) {
+	t.Helper()
+	session := fmt.Sprintf("bucketmux-inventory-ui-%d", time.Now().UnixNano())
+	workDir := t.TempDir()
+	t.Cleanup(func() {
+		cmd := exec.Command(cli, "-s="+session, "close")
+		cmd.Dir = workDir
+		_, _ = cmd.CombinedOutput()
+	})
+
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "open", "about:blank")
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "snapshot")
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "run-code", fmt.Sprintf(`async page => { await page.context().setHTTPCredentials({ username: %q, password: %q }) }`, migrationAdminUser, migrationAdminPassword))
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "goto", baseURL+"/admin")
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "run-code", `async page => { await page.waitForFunction(() => typeof window.htmx === 'object') }`)
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "snapshot")
+
+	keys := make([]string, 0, len(objects))
+	for key := range objects {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	scenario, err := json.Marshal(map[string]any{"prefix": prefix, "expectedObjects": len(objects), "keys": keys})
+	if err != nil {
+		t.Fatalf("Marshal(UI inventory scenario) error = %v", err)
+	}
+	code := fmt.Sprintf(`async page => {
+		const scenario = %s
+		await page.locator('[data-open-dialog="inventory-dialog"]').first().click()
+		await page.locator('#inventory-dialog').waitFor({ state: 'visible' })
+		await page.locator('#inventory-provider').selectOption('local-disk')
+		await page.locator('#inventory-test').click()
+		await page.waitForFunction(() => document.querySelector('#inventory-status')?.textContent.toLowerCase().includes('healthy'))
+		await page.locator('#inventory-discover').click()
+		await page.waitForFunction(() => document.querySelector('#inventory-status')?.textContent.includes('Found 1 remote bucket'))
+		await page.locator('#inventory-logical-bucket').selectOption('images')
+		await page.locator('#inventory-bucket').fill('images')
+		await page.locator('#inventory-prefix').fill(scenario.prefix)
+		await page.locator('#inventory-mode').selectOption('import')
+		await page.locator('#inventory-form button[type="submit"]').click()
+		await page.waitForFunction(() => document.querySelector('#inventory-status')?.textContent.includes('started'))
+		await page.waitForFunction(async ({ prefix, expectedObjects }) => {
+			const jobs = await fetch('/admin/api/inventory-jobs').then((response) => response.json())
+			const job = jobs.find((candidate) => candidate.prefix === prefix.replace(/^\/+/, ''))
+			if (job?.status === 'failed') throw new Error('inventory failed: ' + job.last_error)
+			return job?.status === 'completed' && job.discovered_objects === expectedObjects && job.imported_objects === expectedObjects
+		}, scenario, { timeout: 45000 })
+		await page.locator('#inventory-dialog [data-dialog-close]').first().click()
+
+		await page.locator('#object-browser-bucket').selectOption('images')
+		for (const key of scenario.keys) {
+			const folder = key.slice(0, key.lastIndexOf('/') + 1)
+			await page.locator('#object-browser-prefix').fill(folder)
+			await page.locator('#object-browser-load').click()
+			await page.waitForFunction((expectedKey) => {
+				return [...document.querySelectorAll('#object-browser-rows tr')].some((row) => row.textContent.includes(expectedKey))
+			}, key)
+		}
+	}`, scenario)
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "run-code", code)
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "snapshot")
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "console", "error")
 }
 
 func runMigrationsThroughAdminUI(t *testing.T, cli, baseURL string, cases []migrationE2ECase) {
@@ -297,6 +495,7 @@ func runMigrationsThroughAdminUI(t *testing.T, cli, baseURL string, cases []migr
 	runMigrationPlaywrightCLI(t, cli, session, workDir, "snapshot")
 	runMigrationPlaywrightCLI(t, cli, session, workDir, "run-code", fmt.Sprintf(`async page => { await page.context().setHTTPCredentials({ username: %q, password: %q }) }`, migrationAdminUser, migrationAdminPassword))
 	runMigrationPlaywrightCLI(t, cli, session, workDir, "goto", baseURL+"/admin")
+	runMigrationPlaywrightCLI(t, cli, session, workDir, "run-code", `async page => { await page.waitForFunction(() => typeof window.htmx === 'object') }`)
 	runMigrationPlaywrightCLI(t, cli, session, workDir, "snapshot")
 	runMigrationPlaywrightCLI(t, cli, session, workDir, "run-code", `async page => {
 		await page.locator('[data-open-dialog="migration-dialog"]').first().click()
@@ -305,7 +504,11 @@ func runMigrationsThroughAdminUI(t *testing.T, cli, baseURL string, cases []migr
 	runMigrationPlaywrightCLI(t, cli, session, workDir, "snapshot")
 
 	for _, testCase := range cases {
-		scenario, err := json.Marshal(map[string]string{"key": testCase.key, "source": testCase.source, "target": testCase.target})
+		mode := testCase.mode
+		if mode == "" {
+			mode = domain.MigrationModeMove
+		}
+		scenario, err := json.Marshal(map[string]string{"key": testCase.key, "source": testCase.source, "target": testCase.target, "mode": mode})
 		if err != nil {
 			t.Fatalf("Marshal(UI scenario) error = %v", err)
 		}
@@ -315,11 +518,12 @@ func runMigrationsThroughAdminUI(t *testing.T, cli, baseURL string, cases []migr
 			await page.locator('#migration-prefix').fill(scenario.key)
 			await page.locator('#migration-source-provider').selectOption(scenario.source)
 			await page.locator('#migration-target-provider').selectOption(scenario.target)
-			await page.locator('#migration-mode').selectOption('move')
-			await page.locator('#migration-confirm').fill('Migrate permanently')
+			await page.locator('#migration-mode').selectOption(scenario.mode)
+			await page.locator('#migration-confirm').fill(scenario.mode === 'move' ? 'Migrate permanently' : '')
 			await page.locator('#migration-submit').click()
 			await page.waitForFunction((key) => {
-				return [...document.querySelectorAll('#migration-job-rows tr')].some((row) => row.textContent.includes(key) && row.querySelector('.pill')?.textContent === 'completed')
+				const normalized = key.replace(/^\/+|\/+$/g, '')
+				return [...document.querySelectorAll('#migration-job-rows tr')].some((row) => row.textContent.includes(normalized) && row.querySelector('.pill')?.textContent === 'completed')
 			}, scenario.key, { timeout: 45000 })
 		}`, scenario)
 		runMigrationPlaywrightCLI(t, cli, session, workDir, "run-code", code)
@@ -434,7 +638,7 @@ func runMigrationPlaywrightCLI(t *testing.T, cli, session, workDir string, args 
 	return string(output)
 }
 
-func requireCompletedMigrationForPrefix(t *testing.T, svc *app.Service, prefix string) {
+func requireCompletedMigrationForPrefix(t *testing.T, svc *app.Service, prefix string, expectedObjects int) {
 	t.Helper()
 	jobs, err := svc.Store.ListMigrationJobs(context.Background(), 20)
 	if err != nil {
@@ -442,7 +646,7 @@ func requireCompletedMigrationForPrefix(t *testing.T, svc *app.Service, prefix s
 	}
 	for _, job := range jobs {
 		if job.Prefix == strings.Trim(prefix, "/") {
-			if job.Status != domain.MigrationStatusCompleted || job.TotalObjects != 1 || job.SucceededObjects != 1 || job.FailedObjects != 0 {
+			if job.Status != domain.MigrationStatusCompleted || job.TotalObjects != expectedObjects || job.ProcessedObjects != expectedObjects || job.SucceededObjects != expectedObjects || job.FailedObjects != 0 {
 				t.Fatalf("migration for %s = %+v", prefix, job)
 			}
 			return
@@ -472,6 +676,108 @@ func requireMigrationMovedObject(t *testing.T, svc *app.Service, accounts map[st
 
 	requireMigrationProviderObjectState(t, accounts, localDir, testCase.source, original, false)
 	requireMigrationProviderObjectState(t, accounts, localDir, testCase.target, obj, true)
+}
+
+func requireImportedLocalObjects(t *testing.T, svc *app.Service, localDir string, objects map[string][]byte) {
+	t.Helper()
+	for key, expected := range objects {
+		obj, err := svc.Store.GetObject(context.Background(), "images", key)
+		if err != nil {
+			t.Fatalf("GetObject(%s) after inventory error = %v", key, err)
+		}
+		if obj.ProviderAccountID != "local-disk" || obj.RemoteBucket != "images" || obj.RemoteKey != key || obj.Size != int64(len(expected)) {
+			t.Fatalf("imported object %s = %+v", key, obj)
+		}
+		localBytes, err := os.ReadFile(filepath.Join(localDir, "images", filepath.FromSlash(key)))
+		if err != nil || !bytes.Equal(localBytes, expected) {
+			t.Fatalf("local object %s bytes=%x err=%v, want %x", key, localBytes, err, expected)
+		}
+		requireGatewayObjectBytes(t, svc, key, expected)
+	}
+}
+
+func requirePreexistingMoveToS3(t *testing.T, svc *app.Service, accounts map[string]domain.ProviderAccount, localDir string, objects map[string][]byte) {
+	t.Helper()
+	for key, expected := range objects {
+		obj, err := svc.Store.GetObject(context.Background(), "images", key)
+		if err != nil {
+			t.Fatalf("GetObject(%s) after move error = %v", key, err)
+		}
+		if obj.ProviderAccountID != "s3-target" {
+			t.Fatalf("%s provider = %s, want s3-target", key, obj.ProviderAccountID)
+		}
+		if _, err := os.Stat(filepath.Join(localDir, "images", filepath.FromSlash(key))); !os.IsNotExist(err) {
+			t.Fatalf("moved local source %s still exists or returned unexpected error: %v", key, err)
+		}
+		requireGatewayObjectBytes(t, svc, key, expected)
+		requireS3ObjectBytes(t, accounts["s3-target"], obj, expected)
+	}
+}
+
+func requirePreexistingCopyToS3(t *testing.T, svc *app.Service, accounts map[string]domain.ProviderAccount, localDir string, objects map[string][]byte) {
+	t.Helper()
+	for key, expected := range objects {
+		primary, err := svc.Store.GetObject(context.Background(), "images", key)
+		if err != nil {
+			t.Fatalf("GetObject(%s) after copy error = %v", key, err)
+		}
+		if primary.ProviderAccountID != "local-disk" {
+			t.Fatalf("%s primary provider = %s, want local-disk", key, primary.ProviderAccountID)
+		}
+		localBytes, err := os.ReadFile(filepath.Join(localDir, "images", filepath.FromSlash(key)))
+		if err != nil || !bytes.Equal(localBytes, expected) {
+			t.Fatalf("copied local source %s bytes=%x err=%v, want %x", key, localBytes, err, expected)
+		}
+		replicas, err := svc.Store.ListObjectReplicas(context.Background(), "images", key)
+		if err != nil {
+			t.Fatalf("ListObjectReplicas(%s) error = %v", key, err)
+		}
+		var target *domain.ObjectReplica
+		for index := range replicas {
+			if replicas[index].ProviderAccountID == "s3-target" && replicas[index].Status == "succeeded" {
+				target = &replicas[index]
+				break
+			}
+		}
+		if target == nil {
+			t.Fatalf("%s replicas = %+v, want succeeded s3-target replica", key, replicas)
+		}
+		replicaObject := primary
+		replicaObject.ProviderAccountID = target.ProviderAccountID
+		replicaObject.RemoteBucket = target.RemoteBucket
+		replicaObject.RemoteKey = target.RemoteKey
+		replicaObject.Size = target.Size
+		replicaObject.ETag = target.ETag
+		replicaObject.ChecksumSHA256 = target.ChecksumSHA256
+		requireGatewayObjectBytes(t, svc, key, expected)
+		requireS3ObjectBytes(t, accounts["s3-target"], replicaObject, expected)
+	}
+}
+
+func requireGatewayObjectBytes(t *testing.T, svc *app.Service, key string, expected []byte) {
+	t.Helper()
+	body, _, err := svc.GetObject(context.Background(), "images", key)
+	if err != nil {
+		t.Fatalf("GetObject content(%s) error = %v", key, err)
+	}
+	data, readErr := io.ReadAll(body)
+	_ = body.Close()
+	if readErr != nil || !bytes.Equal(data, expected) {
+		t.Fatalf("%s gateway bytes=%x readErr=%v, want %x", key, data, readErr, expected)
+	}
+}
+
+func requireS3ObjectBytes(t *testing.T, account domain.ProviderAccount, obj domain.ObjectRecord, expected []byte) {
+	t.Helper()
+	body, _, err := provider.NewS3CompatAdapter().Get(context.Background(), account, obj)
+	if err != nil {
+		t.Fatalf("S3-like Get(%s) error = %v", obj.Key, err)
+	}
+	data, readErr := io.ReadAll(body)
+	_ = body.Close()
+	if readErr != nil || !bytes.Equal(data, expected) {
+		t.Fatalf("%s S3-like bytes=%x readErr=%v, want %x", obj.Key, data, readErr, expected)
+	}
 }
 
 func requireMigrationProviderObjectState(t *testing.T, accounts map[string]domain.ProviderAccount, localDir, providerID string, obj domain.ObjectRecord, wantExists bool) {
