@@ -99,6 +99,8 @@ Reads are transparent because BucketMux knows where every object landed.
 
 Object-created events can enqueue durable `bucketmux.wasm.v1` pipelines for transforms, derived files, metadata extraction, classification, typed embeddings (including one vector per detected face), and Lambda-like declarative bucket operations. Guests can request scoped metadata/tag patches, copies, and protected deletes through explicit deny-by-default capability policies; they never receive provider credentials or direct network access. Go 1.27, TinyGo, Rust, and Bun 1.4/AssemblyScript guests run asynchronously with WASI filesystem isolation, import allowlisting, memory/time/stdio/output limits, atomic multi-instance claims, heartbeats, retries, generation deduplication, alerts, audit events, and normal BucketMux placement for every derived or copied object. Embeddings are atomically persisted with model provenance and overwrite invalidation. Turso performs native exact vector search for single-instance deployments; production Postgres deployments can require pgvector 0.8+ and receive transactionally synchronized native vectors, migration backfill, partial HNSW indexes per model profile, iterative scans, and cross-instance index coordination. See [the ABI and security guide](docs/wasm-plugins.md) and examples under `examples/wasm`.
 
+Networked inference remains outside the WASM sandbox. The [Gemini multimodal image embedding example](examples/gemini-image-embeddings/README.md) receives a durable object hook, embeds PNG/JPEG content directly with `gemini-embedding-2`, and imports the vector only if the source generation is still current.
+
 Configured capacity is a hard BucketMux limit. Remote usage is reconciled from
 provider inventory; adapters with a native quota signal can additionally report
 remote capacity. Reservations include in-flight uploads, can retain a safety
@@ -815,7 +817,7 @@ Useful endpoints:
 | `POST /admin/api/wasm-plugins/validate` | Compile and validate a plugin without installing it. |
 | `DELETE /admin/api/wasm-plugins/{id}` | Delete a plugin and its job history. |
 | `GET /admin/api/wasm-plugin-jobs` | Inspect durable plugin execution history. |
-| `GET /admin/api/embeddings?bucket={bucket}&key={key}` | List embedding provenance for an object without exposing vector values. |
+| `GET, POST /admin/api/embeddings` | List redacted embedding provenance, or import generation-bound vectors from an authenticated external worker. |
 | `POST /admin/api/embeddings/search` | Run cosine, dot-product, or L2 search through pgvector/HNSW or the bounded exact fallback. |
 | `GET /admin/api/embeddings/capabilities` | Report exact/pgvector backend, ANN status and active HNSW profiles. |
 | `POST /admin/api/providers/{id}/test` | Test provider credentials and connectivity. |
@@ -882,6 +884,12 @@ Hooks support:
 - delivery history,
 - retries,
 - admin visibility.
+
+The ordinary `object.created` payload includes `checksumSHA256` and
+`objectUpdatedAt`. External inference workers should return both when importing
+results so an overwrite cannot attach a stale vector to the new object. See the
+[Gemini image embedding worker](examples/gemini-image-embeddings/README.md) for
+a complete asynchronous example.
 
 ---
 

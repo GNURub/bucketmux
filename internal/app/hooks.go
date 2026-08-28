@@ -34,6 +34,8 @@ type HookPayload struct {
 	Size              int64     `json:"size"`
 	ContentType       string    `json:"contentType"`
 	ETag              string    `json:"etag"`
+	ChecksumSHA256    string    `json:"checksumSHA256"`
+	ObjectUpdatedAt   time.Time `json:"objectUpdatedAt"`
 	ReplicaStatus     string    `json:"replicaStatus"`
 	Timestamp         time.Time `json:"timestamp"`
 }
@@ -118,6 +120,15 @@ func (s *Service) dispatchObjectHook(ctx context.Context, event string, obj doma
 	if err != nil || len(hooks) == 0 {
 		return
 	}
+	if event == domain.HookEventObjectCreated {
+		// Store.PutObject owns the authoritative updated_at. External workers use
+		// this value as an optimistic generation token when importing results.
+		persisted, err := s.Store.GetObject(ctx, obj.Bucket, obj.Key)
+		if err != nil {
+			return
+		}
+		obj = persisted
+	}
 	payload := HookPayload{
 		Event:             event,
 		Bucket:            obj.Bucket,
@@ -128,6 +139,8 @@ func (s *Service) dispatchObjectHook(ctx context.Context, event string, obj doma
 		Size:              obj.Size,
 		ContentType:       obj.ContentType,
 		ETag:              obj.ETag,
+		ChecksumSHA256:    obj.ChecksumSHA256,
+		ObjectUpdatedAt:   obj.UpdatedAt,
 		ReplicaStatus:     obj.ReplicaStatus,
 		Timestamp:         time.Now().UTC(),
 	}

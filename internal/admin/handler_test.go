@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gnurub/bucketmux/internal/app"
 	"github.com/gnurub/bucketmux/internal/config"
@@ -152,6 +153,54 @@ func TestEmbeddingAdminAPIListsWithoutValuesAndSearches(t *testing.T) {
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"backend":"turso-native-exact"`) || !strings.Contains(res.Body.String(), `"engine":"turso"`) {
 		t.Fatalf("capabilities status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestEmbeddingAdminAPIImportsOnlyCurrentObjectGeneration(t *testing.T) {
+	handler, cleanup := newTestAdminHandlerWithProvider(t)
+	defer cleanup()
+	ctx := context.Background()
+	object := domain.ObjectRecord{Bucket: "images", Key: "semantic/cat.jpg", ProviderAccountID: "local-test", RemoteBucket: "images", RemoteKey: "semantic/cat.jpg", Size: 3, ChecksumSHA256: "generation-one"}
+	if err := handler.svc.Store.PutObject(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	object, err := handler.svc.Store.GetObject(ctx, object.Bucket, object.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"bucket": object.Bucket, "key": object.Key, "producer_id": "external:gemini-image-embedding",
+		"source_checksum": object.ChecksumSHA256, "source_updated_at": object.UpdatedAt,
+		"embeddings": []any{map[string]any{
+			"kind": "image-multimodal", "model": "gemini-embedding-2", "model_version": "gemini-embedding-2;dimensions=3",
+			"metric": "cosine", "dimensions": 3, "values": []float32{1, 0, 0},
+			"metadata": map[string]string{"provider": "google-gemini"},
+		}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/embeddings", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("admin", "change-me")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusCreated || strings.Contains(res.Body.String(), `"values"`) || !strings.Contains(res.Body.String(), "gemini-embedding-2") {
+		t.Fatalf("import status=%d body=%s", res.Code, res.Body.String())
+	}
+	stored, err := handler.svc.Store.ListObjectEmbeddings(ctx, object.Bucket, object.Key, true)
+	if err != nil || len(stored) != 1 || len(stored[0].Values) != 3 || stored[0].PluginID != "external:gemini-image-embedding" {
+		t.Fatalf("stored embeddings=%+v err=%v", stored, err)
+	}
+	object.ChecksumSHA256 = "generation-two"
+	object.UpdatedAt = time.Now().UTC().Add(time.Second)
+	if err := handler.svc.Store.PutObject(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/embeddings", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("admin", "change-me")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusConflict || !strings.Contains(res.Body.String(), "embedding-source-superseded") {
+		t.Fatalf("stale import status=%d body=%s", res.Code, res.Body.String())
 	}
 }
 

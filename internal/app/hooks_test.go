@@ -60,7 +60,11 @@ func TestHTTPHooksFireForObjectEvents(t *testing.T) {
 		t.Fatalf("PutObject() error = %v", err)
 	}
 	created := waitHookPayload(t, received)
-	if created.Event != domain.HookEventObjectCreated || created.Bucket != obj.Bucket || created.Key != obj.Key || created.ProviderAccountID != "local-hook-test" || created.Size != int64(len("hello hooks")) {
+	persisted, err := svc.Store.GetObject(context.Background(), obj.Bucket, obj.Key)
+	if err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	}
+	if created.Event != domain.HookEventObjectCreated || created.Bucket != obj.Bucket || created.Key != obj.Key || created.ProviderAccountID != "local-hook-test" || created.Size != int64(len("hello hooks")) || created.ChecksumSHA256 != persisted.ChecksumSHA256 || !created.ObjectUpdatedAt.Equal(persisted.UpdatedAt) {
 		t.Fatalf("created payload = %+v", created)
 	}
 	waitHookDeliveryStatus(t, svc, domain.HookEventObjectCreated, domain.HookDeliveryStatusSucceeded, 1)

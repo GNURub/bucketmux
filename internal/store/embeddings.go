@@ -24,6 +24,8 @@ const (
 	maximumEmbeddingDimensions = 4096
 )
 
+var ErrObjectGenerationSuperseded = errors.New("object generation was superseded")
+
 // ReplaceObjectEmbeddings atomically replaces every embedding produced by one
 // plugin for one immutable object generation. Retries therefore cannot create
 // duplicates or leave a half-written set behind.
@@ -44,6 +46,23 @@ func (s *Store) ReplaceObjectEmbeddings(ctx context.Context, object domain.Objec
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// This conditional no-op write both verifies the immutable generation and
+	// serializes it against concurrent overwrites before replacing vectors.
+	// A check performed only by the caller would leave a TOCTOU window.
+	generation, err := tx.ExecContext(ctx, s.rebind(`
+UPDATE objects SET updated_at = updated_at
+WHERE bucket = ? AND key = ? AND checksum_sha256 = ? AND updated_at = ?`),
+		object.Bucket, object.Key, object.ChecksumSHA256, optionalTimeString(object.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("lock embedding source generation: %w", err)
+	}
+	matched, err := generation.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("inspect embedding source generation: %w", err)
+	}
+	if matched != 1 {
+		return ErrObjectGenerationSuperseded
+	}
 	if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM object_embeddings WHERE bucket = ? AND key = ? AND plugin_id = ?`), object.Bucket, object.Key, pluginID); err != nil {
 		return fmt.Errorf("delete previous embeddings: %w", err)
 	}

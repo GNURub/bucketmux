@@ -350,6 +350,9 @@ func (s *Service) applyWASMPluginResult(ctx context.Context, plugin domain.WASMP
 	}
 	_ = s.Store.HydrateObjectAttributes(ctx, &current)
 	if err := s.Store.ReplaceObjectEmbeddings(ctx, current, plugin.ID, execution.Result.Embeddings); err != nil {
+		if errors.Is(err, store.ErrObjectGenerationSuperseded) {
+			return errWASMSourceSuperseded
+		}
 		return fmt.Errorf("store plugin embeddings: %w", err)
 	}
 	current.Metadata = mergeStringMaps(current.Metadata, execution.Result.Metadata)

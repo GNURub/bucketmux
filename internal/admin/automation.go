@@ -78,7 +78,7 @@ func (h *Handler) openapi(w http.ResponseWriter, r *http.Request) {
 		"/admin/api/wasm-plugins":                   {"get", "post"},
 		"/admin/api/wasm-plugins/validate":          {"post"},
 		"/admin/api/wasm-plugin-jobs":               {"get"},
-		"/admin/api/embeddings":                     {"get"},
+		"/admin/api/embeddings":                     {"get", "post"},
 		"/admin/api/embeddings/capabilities":        {"get"},
 		"/admin/api/embeddings/search":              {"post"},
 		"/admin/api/buckets":                        {"get", "post"},

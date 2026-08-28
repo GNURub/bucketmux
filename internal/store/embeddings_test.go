@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"math"
 	"path/filepath"
 	"testing"
@@ -85,6 +86,36 @@ func TestObjectEmbeddingValidation(t *testing.T) {
 	query := domain.EmbeddingSearchQuery{Model: "arcface", Values: []float32{1}, Metric: "hamming"}
 	if err := normalizeEmbeddingSearchQuery(&query); err == nil {
 		t.Fatal("expected unsupported metric error")
+	}
+}
+
+func TestReplaceObjectEmbeddingsRejectsSupersededGeneration(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "embedding-generation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+	if err := s.UpsertProvider(ctx, domain.ProviderAccount{ID: "local", Name: "local", Kind: domain.ProviderKindLocal, Bucket: "data", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	object := domain.ObjectRecord{Bucket: "photos", Key: "changed.jpg", ProviderAccountID: "local", RemoteBucket: "data", RemoteKey: "changed.jpg", ChecksumSHA256: "v1"}
+	if err := s.PutObject(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.GetObject(ctx, object.Bucket, object.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object.ChecksumSHA256 = "v2"
+	if err := s.PutObject(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	err = s.ReplaceObjectEmbeddings(ctx, stale, "worker", []domain.WASMPluginEmbedding{{
+		Kind: "image", Model: "test", ModelVersion: "1", Metric: "cosine", Dimensions: 2, Values: []float32{1, 0},
+	}})
+	if !errors.Is(err, ErrObjectGenerationSuperseded) {
+		t.Fatalf("ReplaceObjectEmbeddings() error = %v, want ErrObjectGenerationSuperseded", err)
 	}
 }
 

@@ -1,0 +1,10 @@
+{
+  "name": "bucketmux-gemini-image-embeddings-example",
+  "private": true,
+  "packageManager": "bun@1.4.1",
+  "scripts": {
+    "start": "bun run server.ts",
+    "query": "bun run query.ts",
+    "test": "bun test"
+  }
+}

@@ -1,4 +1,4 @@
-.PHONY: run-local build test test-race test-turso-vector-scale lint vulncheck ci backup-postgres restore-postgres test-bun test-fetch test-imgproxy test-k6 test-migration test-ministack test-multi-instance test-uppy test-seaweedfs test-redis test-wasm-plugins
+.PHONY: run-local build test test-race test-turso-vector-scale lint vulncheck ci backup-postgres restore-postgres test-bun test-fetch test-imgproxy test-k6 test-migration test-ministack test-multi-instance test-uppy test-seaweedfs test-redis test-wasm-plugins test-gemini-image-embeddings
 
 run-local:
 	mkdir -p data
@@ -69,3 +69,6 @@ test-wasm-plugins:
 	./examples/wasm/rust/build.sh
 	cd examples/wasm/bun-assemblyscript && bun install --frozen-lockfile && bun run build && bun test
 	BUCKETMUX_RUN_WASM_EXAMPLES=1 GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go/pkg/mod go test ./internal/wasmplugin ./internal/app ./internal/admin -run 'TestGoBuiltWASMExamples|TestRustAndBunBuiltWASMExamples|TestGoEmbeddingPipelineSingleAndMultipleInstances|TestWASMPipelineSingleAndMultipleInstances|TestWASMDeclarativeBucketOperationsSingleAndMultipleInstances|TestWASMOperationsDenyByDefaultAndRespectObjectLock|TestWASMPluginAdminAPIInstallsRustGuest|TestEmbeddingAdminAPIListsWithoutValuesAndSearches' -count=1 -v
+
+test-gemini-image-embeddings:
+	cd examples/gemini-image-embeddings && bun test

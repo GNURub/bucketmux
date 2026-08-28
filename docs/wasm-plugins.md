@@ -152,6 +152,12 @@ An `object.copy` never creates its destination bucket. It reads through BucketMu
 
 This is intentionally Lambda-like rather than an AWS Lambda compatibility layer: triggers and durable retries are managed by BucketMux, while storage effects use a portable result manifest instead of an AWS SDK or provider credentials inside the guest.
 
+### Networked inference workers
+
+WASM guests intentionally cannot call OpenAI or another remote inference API. Use an authenticated HTTP hook and an external worker when inference requires network access, provider SDKs, or secrets. `POST /admin/api/embeddings` accepts vectors from that worker together with `source_checksum` and `source_updated_at`; BucketMux returns `409` instead of persisting the result when the object generation is no longer current. Imported vector values are write-only through the admin API and remain redacted from list and search responses.
+
+The runnable [Gemini multimodal image example](../examples/gemini-image-embeddings/README.md) uses this architecture. It embeds PNG/JPEG bytes directly with `gemini-embedding-2`, maintains a restart-safe file queue, and performs cross-modal text-to-image search. It is a general visual-semantic vector, not a face or biometric embedding pipeline.
+
 Embedding vectors are a typed result, not S3 metadata. BucketMux accepts at most 128 vectors per invocation and 4096 finite `float32` dimensions per vector. `model`, `model_version`, dimensions and one of `cosine`, `dot` or `l2` are validated before any result is committed. Vectors are written as compact portable little-endian BLOBs plus a native Turso `vector32` value in single-instance mode (and `BYTEA` plus pgvector in Postgres), atomically replaced per object/plugin generation, and removed through the object's foreign-key cascade. A source overwrite invalidates old embeddings immediately.
 
 The admin API never returns stored vector values in list or search results, and plugin job history redacts them. Use `GET /admin/api/embeddings?bucket=...&key=...` for provenance summaries and `POST /admin/api/embeddings/search` with a query vector. Scores are ordered high-to-low; L2 is represented as negative Euclidean distance. `GET /admin/api/embeddings/capabilities` reports whether the active backend is exact or ANN.
