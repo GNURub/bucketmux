@@ -38,9 +38,18 @@ func (c *tursoConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		_ = connection.Close()
 		return nil, fmt.Errorf("turso driver connection does not implement driver.ExecerContext")
 	}
-	if _, err := execer.ExecContext(ctx, `PRAGMA foreign_keys = ON`, nil); err != nil {
-		_ = connection.Close()
-		return nil, fmt.Errorf("enable Turso foreign keys on pooled connection: %w", err)
+	for _, pragma := range []struct {
+		query       string
+		description string
+	}{
+		{query: `PRAGMA foreign_keys = ON`, description: "foreign keys"},
+		{query: `PRAGMA synchronous = NORMAL`, description: "normal synchronous mode"},
+		{query: `PRAGMA busy_timeout = 5000`, description: "busy timeout"},
+	} {
+		if _, err := execer.ExecContext(ctx, pragma.query, nil); err != nil {
+			_ = connection.Close()
+			return nil, fmt.Errorf("configure Turso %s on pooled connection: %w", pragma.description, err)
+		}
 	}
 	return connection, nil
 }

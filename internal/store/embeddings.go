@@ -320,10 +320,6 @@ func normalizeEmbeddingSearchQuery(query *domain.EmbeddingSearchQuery) error {
 	return nil
 }
 
-func embeddingScore(metric string, query, candidate []float32) (float64, bool) {
-	return embeddingScoreWithQueryNorm(metric, query, candidate, vectorSquaredNorm(query))
-}
-
 func embeddingScoreWithQueryNorm(metric string, query, candidate []float32, queryNorm float64) (float64, bool) {
 	if len(query) == 0 || len(query) != len(candidate) {
 		return 0, false

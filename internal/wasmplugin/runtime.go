@@ -90,7 +90,7 @@ func validateCompiledModule(compiled wazero.CompiledModule) error {
 	}
 	for _, function := range compiled.ImportedFunctions() {
 		moduleName, name, imported := function.Import()
-		if imported && moduleName != wasi_snapshot_preview1.ModuleName && !(moduleName == "env" && allowedAssemblyScriptImport(name)) {
+		if imported && moduleName != wasi_snapshot_preview1.ModuleName && (moduleName != "env" || !allowedAssemblyScriptImport(name)) {
 			return fmt.Errorf("unsupported import %s.%s: only WASI Preview 1 is allowed", moduleName, name)
 		}
 	}

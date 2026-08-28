@@ -63,9 +63,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if isMutatingMethod(r.Method) {
 		limit := h.svc.Config.Server.MaxAdminBodyBytes
-		if path == "/upload" {
+		switch path {
+		case "/upload":
 			limit = h.svc.Config.Server.MaxUploadBytes + (1 << 20)
-		} else if path == "/api/wasm-plugins" || path == "/api/wasm-plugins/validate" || path == "/api/declarative/apply" {
+		case "/api/wasm-plugins", "/api/wasm-plugins/validate", "/api/declarative/apply":
 			pluginLimit := h.svc.Config.WASMPlugins.MaxModuleBytes*4/3 + (1 << 20)
 			if pluginLimit > limit {
 				limit = pluginLimit

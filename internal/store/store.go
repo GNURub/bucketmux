@@ -87,6 +87,15 @@ func openTurso(path string, maxOpenConns, maxIdleConns int) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping turso: %w", err)
 	}
+	var journalMode string
+	if err := db.QueryRowContext(context.Background(), `PRAGMA journal_mode = WAL`).Scan(&journalMode); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable turso WAL journal: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		_ = db.Close()
+		return nil, fmt.Errorf("enable turso WAL journal: database selected %q", journalMode)
+	}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err

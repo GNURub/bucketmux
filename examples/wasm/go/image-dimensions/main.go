@@ -18,7 +18,7 @@ func handle(_ context.Context, invocation bucketmuxplugin.Invocation) (bucketmux
 	if err != nil {
 		return bucketmuxplugin.Result{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	config, format, err := image.DecodeConfig(file)
 	if err != nil {
 		return bucketmuxplugin.Result{}, fmt.Errorf("decode image header: %w", err)

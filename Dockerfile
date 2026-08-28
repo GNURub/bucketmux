@@ -22,7 +22,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
-RUN apk add --no-cache ca-certificates libgcc
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates libgcc
 
 WORKDIR /app
 COPY --from=build --chown=10001:10001 /out/data /data

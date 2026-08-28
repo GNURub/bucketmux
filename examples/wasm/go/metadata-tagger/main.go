@@ -16,7 +16,7 @@ func handle(_ context.Context, invocation bucketmuxplugin.Invocation) (bucketmux
 	if err != nil {
 		return bucketmuxplugin.Result{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	hash := sha256.New()
 	size, err := io.Copy(hash, file)
 	if err != nil {

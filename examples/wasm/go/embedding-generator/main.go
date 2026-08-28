@@ -20,7 +20,7 @@ func handle(_ context.Context, invocation bucketmuxplugin.Invocation) (bucketmux
 	if err != nil {
 		return bucketmuxplugin.Result{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	values := make([]float32, dimensions)
 	buffer := make([]byte, 32*1024)
 	for {
