@@ -3,13 +3,13 @@ module github.com/gnurub/bucketmux
 go 1.27.0
 
 require (
-	github.com/coreos/go-oidc/v3 v3.20.0
-	github.com/jackc/pgx/v5 v5.10.0
-	github.com/tetratelabs/wazero v1.11.0
-	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sys v0.47.0
+	github.com/coreos/go-oidc/v3 v3.21.0
+	github.com/jackc/pgx/v5 v5.11.0
+	github.com/tetratelabs/wazero v1.12.0
+	golang.org/x/oauth2 v0.37.0
+	golang.org/x/sys v0.48.0
 	gopkg.in/yaml.v3 v3.0.1
-	turso.tech/database/tursogo v0.7.2
+	turso.tech/database/tursogo v0.8.1
 )
 
 require (
@@ -20,7 +20,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
-	github.com/tursodatabase/turso-go-platform-libs v0.7.2 // indirect
+	github.com/tursodatabase/turso-go-platform-libs v0.8.1 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
 )
